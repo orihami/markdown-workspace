@@ -55,7 +55,8 @@
 - **正本は HDD の `OMNI`**、整理待ちは HDD の `_整理待ち`（`/etc/markdown-workspace/env`）。service は `RequiresMountsFor` で HDD が外れたら止まり、戻ったら HDD の見張り（`kopi-hdd-watchdog`）が起動する。書き込めるのは `ReadWritePaths` の OMNI と `_整理待ち` だけ
 - 切り替えの前に OMNI のバックアップを用意: ko-pi の `~/backup-omni/日付/` に毎日 05:23（`kopi-omni-snapshot.timer`、30日分、ハードリンクで差分だけ）。2026-11-02 分はハッシュで全件照合済み。それまで OMNI はどこにも写されていなかった（kopi-backup は SSD→HDD だけ。OMNI/.git は 2025-08 から止まっている）
 - 一覧・検索は隠しフォルダ・venv・node_modules・__pycache__ の中に入らない（HDD の負担を減らす）
-- テスト用のコピー `~/markdown-workspace-data/test-vault` は残してある。そこでだけ作られたノートが6件（githab・どうだ・検証・アプリの様子見・めも/ｋ・めも/あ）。本物には入れていない（ユーザーが要るといえば移す）
+- テスト用のコピーは本人の指示で削除した（2026-11-02 20:50）
+- 置き場所の方針（本人と決定 2026-11-02）: **正本は HDD に直接書く。SSD はあくまで保険（毎日の写し）**。HDD はパソコンからも使う集約場所なので、正本を SSD に分けて置き場所を増やさない。測った速さ: 読む 2ms、保存（書いて fsync して置きかえ）約 90ms（HDD が止まっていたときの最初だけ約 0.4秒）。入力は端末の中で先に反映し、保存は入力が止まってから裏で送るので、打つ速さには関係しない
 - テスト: backend 25件、e2e 59項目、成功
 
 ## GitHub

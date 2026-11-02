@@ -310,30 +310,136 @@ def create_note(body: CreateRequest):
     return {"ok": True, "path": body.path, "etag": etag_for(payload)}
 
 
+# ---- 検索・タグ(ファイルを読み、更新時刻が変わるまで覚えておく) ----
+
+_text_cache: dict[str, tuple[float, int, str]] = {}
+_text_cache_guard = threading.Lock()
+FENCE_RE = re.compile(r"^\s*(```|~~~)")
+INLINE_TAG_RE = re.compile(r"(?<![\w/#&])#([^\s#\[\](){}.,!?;:'\"`<>|]+)")
+
+
+def iter_notes(root: Path):
+    for path in root.rglob("*.md"):
+        rel = path.relative_to(root)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        if path.is_symlink() or not path.is_file():
+            continue
+        yield rel.as_posix(), path
+
+
+def note_text(rel: str, path: Path) -> Optional[str]:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if st.st_size > MAX_NOTE_BYTES:
+        return None
+    with _text_cache_guard:
+        hit = _text_cache.get(rel)
+    if hit and hit[0] == st.st_mtime and hit[1] == st.st_size:
+        return hit[2]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    with _text_cache_guard:
+        _text_cache[rel] = (st.st_mtime, st.st_size, text)
+    return text
+
+
+def split_frontmatter(text: str) -> tuple[list[str], list[str]]:
+    lines = text.splitlines()
+    if len(lines) > 1 and lines[0].strip() == "---":
+        for i in range(1, min(len(lines), 200)):
+            if lines[i].strip() in ("---", "..."):
+                return lines[1:i], lines[i + 1:]
+    return [], lines
+
+
+def tags_of(text: str) -> set[str]:
+    """Frontmatter の tags と本文の #タグ(コードの中はのぞく)。ファイルは変えない"""
+    fm, body = split_frontmatter(text)
+    tags: set[str] = set()
+    in_tags = False
+    for line in fm:
+        m = re.match(r"^(tags?|aliases)\s*:\s*(.*)$", line)
+        if m:
+            in_tags = m.group(1) != "aliases"
+            value = m.group(2).strip()
+            if in_tags and value:
+                value = value.strip("[]")
+                tags.update(t.strip().strip("'\"").lstrip("#") for t in re.split(r"[,\s]+", value) if t.strip())
+                in_tags = False
+            continue
+        if in_tags:
+            item = re.match(r"^\s*-\s*(.+)$", line)
+            if item:
+                tags.add(item.group(1).strip().strip("'\"").lstrip("#"))
+            elif line.strip():
+                in_tags = False
+    fenced = False
+    for line in body:
+        if FENCE_RE.match(line):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        for m in INLINE_TAG_RE.finditer(re.sub(r"`[^`]*`", "", line)):
+            tag = m.group(1)
+            if not tag.replace("/", "").isdigit():
+                tags.add(tag)
+    tags.discard("")
+    return tags
+
+
 @app.get("/api/search", dependencies=[Depends(require_auth)])
-def search(q: str = ""):
+def search(q: str = "", tag: str = "", limit: int = 50):
+    """名前・本文を探す。名前で当たったものを先に。本文で当たったものは前後の文を付ける。
+    tag を付けると、そのタグ(Frontmatter または本文の #タグ)を持つノートだけ"""
+    root = ensure_root()
+    if tag.strip():
+        want = tag.strip().lstrip("#").casefold()
+        hits = []
+        for rel, path in iter_notes(root):
+            text = note_text(rel, path)
+            if text is not None and any(t.casefold() == want or t.casefold().startswith(want + "/") for t in tags_of(text)):
+                hits.append({"path": rel, "name": path.stem, "snippet": None})
+        hits.sort(key=lambda i: i["path"].casefold())
+        return {"items": hits[: max(1, min(limit, 500))]}
     query = q.strip().casefold()
     if not query:
         return {"items": []}
+    by_name, by_body = [], []
+    for rel, path in iter_notes(root):
+        text = note_text(rel, path)
+        name_hit = query in rel.casefold()
+        snippet = None
+        if text is not None:
+            pos = text.casefold().find(query)
+            if pos >= 0:
+                start = max(0, pos - 40)
+                snippet = text[start:pos + len(query) + 60].replace("\n", " ").strip()
+        if name_hit:
+            by_name.append({"path": rel, "name": path.stem, "snippet": snippet})
+        elif snippet is not None:
+            by_body.append({"path": rel, "name": path.stem, "snippet": snippet})
+    items = (by_name + by_body)[: max(1, min(limit, 200))]
+    return {"items": items}
+
+
+@app.get("/api/tags", dependencies=[Depends(require_auth)])
+def tags():
     root = ensure_root()
-    results = []
-    for path in root.rglob("*.md"):
-        if path.is_symlink() or not path.is_file():
+    counts: dict[str, int] = {}
+    for rel, path in iter_notes(root):
+        text = note_text(rel, path)
+        if text is None:
             continue
-        rel = path.relative_to(root).as_posix()
-        if any(part.startswith(".") for part in Path(rel).parts):
-            continue
-        try:
-            if path.stat().st_size > MAX_NOTE_BYTES:
-                continue
-            content = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if query in rel.casefold() or query in content.casefold():
-            results.append({"path": rel, "name": path.stem})
-        if len(results) >= 100:
-            break
-    return {"items": results}
+        for tag in tags_of(text):
+            counts[tag] = counts.get(tag, 0) + 1
+    items = sorted(({"tag": t, "count": c} for t, c in counts.items()), key=lambda x: (-x["count"], x["tag"].casefold()))
+    return {"items": items}
 
 
 # ---- フロントエンド(ビルド済み)を同じポートで配る ----
@@ -349,5 +455,9 @@ def frontend(asset_path: str):
     except ValueError:
         raise HTTPException(status_code=404, detail="Not found")
     if asset_path and target.is_file():
-        return FileResponse(target)
+        # 名前に版の入ったファイル(assets/)は長く覚えさせ、それ以外(sw.js など)は毎回確かめさせる
+        cache = "public, max-age=31536000, immutable" if asset_path.startswith("assets/") else "no-cache"
+        return FileResponse(target, headers={"Cache-Control": cache})
+    if "." in PurePosixPath(asset_path).name:
+        raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(dist / "index.html", headers={"Cache-Control": "no-cache"})

@@ -1,8 +1,8 @@
-// ブラウザでの通しテスト。テスト用の Vault をコピーして API を起動し、実際に入力・保存・停止・再送・競合を確かめる
+// ブラウザでの通しテスト。テスト用の Vault を作って API を起動し、実際に入力・保存・停止・再送・競合などを確かめる
 //   cd frontend && npm run build && npm run e2e
 import { chromium } from 'playwright'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync, existsSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,23 +11,25 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const work = mkdtempSync(join(tmpdir(), 'mw-e2e-'))
 const vault = join(work, 'vault')
 mkdirSync(join(vault, 'sub'), { recursive: true })
-writeFileSync(join(vault, 'はじめに.md'), '---\ntags:\n  - test\n---\n# はじめに\n\n[[別のノート]] https://example.com\n\n```js\nconst a = 1\n```\n')
-writeFileSync(join(vault, 'sub', 'メモ.md'), '# メモ\r\n\r\nCRLF のノート\r\n')
+const FIRST = '---\ntags:\n  - test\n---\n# はじめに\n\n[[メモ]] と [外部](https://example.com/x)\n\n```js\nconst a = 1\n```\n'
+writeFileSync(join(vault, 'はじめに.md'), FIRST)
+writeFileSync(join(vault, 'sub', 'メモ.md'), '# メモ\r\n\r\nCRLF のノート #sample\r\n')
 const port = 18000 + Math.floor(Math.random() * 1000)
 const base = `http://127.0.0.1:${port}`
+const read = (p) => readFileSync(join(vault, p), 'utf8')
 let failed = false
 const check = (ok, msg) => { console.log((ok ? 'OK   ' : 'NG   ') + msg); if (!ok) failed = true }
 
-let api
+let apiProc
 function startApi() {
-  api = spawn(join(root, 'backend/.venv/bin/uvicorn'), ['app.main:app', '--host', '127.0.0.1', '--port', String(port)], {
+  apiProc = spawn(join(root, 'backend/.venv/bin/uvicorn'), ['app.main:app', '--host', '127.0.0.1', '--port', String(port)], {
     cwd: join(root, 'backend'),
     env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base },
     stdio: 'ignore',
   })
   return waitFor(async () => (await fetch(base + '/api/health').catch(() => null))?.ok)
 }
-const stopApi = () => new Promise((r) => { api.once('exit', r); api.kill() })
+const stopApi = () => new Promise((r) => { apiProc.once('exit', r); apiProc.kill() })
 async function waitFor(fn, ms = 15000) {
   const end = Date.now() + ms
   while (Date.now() < end) { if (await fn()) return true; await new Promise((r) => setTimeout(r, 200)) }
@@ -37,26 +39,39 @@ async function waitFor(fn, ms = 15000) {
 const browser = await chromium.launch()
 try {
   check(await startApi(), 'API が起動')
-  const page = await browser.newPage({ viewport: { width: 390, height: 844 } })
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+  // http で開いたときと同じく crypto.randomUUID が無い状態にする(2026-11-02 に保存が1回も送られなかった原因)
+  await ctx.addInitScript(() => { try { Object.defineProperty(Crypto.prototype, 'randomUUID', { value: undefined }) } catch {} })
+  await ctx.route(/fonts\.(googleapis|gstatic)\.com/, (r) => r.abort())
+  await ctx.route(/example\.com/, (r) => r.fulfill({ body: 'ok' }))
+  const page = await ctx.newPage()
   const errors = []
   page.on('pageerror', (e) => errors.push(e.message))
-  await page.route(/fonts\.(googleapis|gstatic)\.com/, (r) => r.abort())
+  page.on('dialog', (d) => d.accept())
+  const puts = []
+  page.on('request', (r) => { if (r.method() === 'PUT') puts.push(r.url()) })
+
   await page.goto(base)
-  await page.waitForSelector('.note-item')
-  check((await page.locator('.note-item').count()) === 2, 'ノート一覧に2件')
+  check(await page.isVisible('.welcome'), 'はじめは「最近のノート」の画面')
+  await page.waitForSelector('.tree-folder')
+  check((await page.locator('.tree-folder').count()) === 1 && (await page.locator('.note-item').count()) === 1, 'フォルダの木: sub フォルダとノート1件')
+  await page.click('.tree-folder:has-text("sub")')
+  check(await page.isVisible('.note-item:has-text("メモ")'), 'フォルダを開くと中のノートが出る')
   await page.click('.note-item:has-text("はじめに")')
   await page.waitForSelector('.cm-content')
-  check((await page.textContent('.document-title')) === 'はじめに', 'タイトルに .md が付かない')
+  check((await page.textContent('.document-title')) === 'はじめに', 'ノートを開く(タイトルに .md が付かない)')
+  check(decodeURIComponent(new URL(page.url()).hash) === '#/はじめに.md', 'URL にノートの場所が入る')
 
-  // 入力 → 保存済み → ファイルに反映(Frontmatter・リンク・コードはそのまま)
+  // 入力 → 保存済み(randomUUID が無くても送られる)
   await page.click('.cm-content')
   await page.keyboard.press('Control+End')
   await page.keyboard.type('追記した行')
-  await page.waitForSelector('.save-indicator.saved', { timeout: 10000 })
-  const saved = readFileSync(join(vault, 'はじめに.md'), 'utf8')
-  check(saved.includes('追記した行') && saved.startsWith('---\ntags:\n  - test\n---\n') && saved.includes('[[別のノート]]') && saved.includes('```js'), '保存するとファイルに反映され、Frontmatter・リンク・コードが残る')
+  await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })
+  const saved = read('はじめに.md')
+  check(puts.length > 0 && saved.includes('追記した行'), `randomUUID が使えない(http と同じ)状態でも保存が送られる(PUT ${puts.length}回)`)
+  check(saved.startsWith('---\ntags:\n  - test\n---\n') && saved.includes('[[メモ]]') && saved.includes('```js'), '保存しても Frontmatter・リンク・コードはそのまま')
 
-  // / の候補をキーボードで選ぶ
+  // / の候補
   await page.keyboard.press('Enter')
   await page.keyboard.type('/')
   check(await page.isVisible('.command-menu'), '/ で候補が出る')
@@ -64,96 +79,164 @@ try {
   await page.keyboard.press('ArrowDown')
   await page.keyboard.press('Enter')
   await page.keyboard.type('見出しのテスト')
-  await page.waitForSelector('.save-indicator.saved', { timeout: 10000 })
-  const h2 = readFileSync(join(vault, 'はじめに.md'), 'utf8')
-  check(h2.includes('\n## 見出しのテスト'), '↓ Enter で「見出し 2」が入る')
-
-  // Obsidian表示: # は見出しの大きさに、- は点に。記号はカーソルの行だけ見える。ファイルの中身は変わらない
-  check((await page.locator('.mode-switch button.selected').textContent()).includes('Obsidian'), 'はじめは Obsidian表示')
   await page.keyboard.press('Enter')
   await page.keyboard.type('- 箇条書きの行')
   await page.keyboard.press('Enter')
   await page.keyboard.press('Enter')
-  await page.keyboard.type('とても長い行'.repeat(30))
-  await page.waitForSelector('.save-indicator.saved', { timeout: 10000 })
-  const h2line = page.locator('.cm-line.cm-lp-h2', { hasText: '見出しのテスト' })
-  check((await h2line.count()) === 1 && !(await h2line.textContent()).includes('#'), '見出しの行は大きく、# はカーソルが無いと隠れる')
-  check((await page.locator('.cm-line', { hasText: '箇条書きの行' }).locator('.cm-lp-bullet').count()) === 1, '- は点(•)で表示')
-  const wrap = await page.evaluate(() => { const c = document.querySelector('.cm-scroller'); return c.scrollWidth <= c.clientWidth + 1 })
-  check(wrap, '長い行は折り返す(横にはみ出さない)')
-  const raw = readFileSync(join(vault, 'はじめに.md'), 'utf8')
-  check(raw.includes('\n## 見出しのテスト') && raw.includes('\n- 箇条書きの行') && raw.startsWith('---\ntags:'), 'ファイルには Markdown がそのまま保存される')
+  await page.keyboard.press('Enter')
+  await page.keyboard.type('とても長い行'.repeat(40))
+  await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })
+  check(read('はじめに.md').includes('\n## 見出しのテスト\n- 箇条書きの行'), '↓↓ Enter で「見出し 2」、- で箇条書き(ファイルは Markdown のまま)')
 
-  // Notion表示: 改行すると候補が出る。そのまま書けば普通の文、選べばブロックになる
-  await page.click('.mode-switch button:has-text("Notion")')
+  // Obsidian表示の見た目
+  const h2line = page.locator('.cm-line.cm-lp-h2', { hasText: '見出しのテスト' })
+  check((await h2line.count()) === 1 && !(await h2line.textContent()).includes('#'), 'Obsidian表示: 見出しは大きく、# はカーソルが無いと隠れる')
+  check((await page.locator('.cm-line', { hasText: '箇条書きの行' }).locator('.cm-lp-bullet').count()) === 1, 'Obsidian表示: - は点(•)')
+  check(await page.evaluate(() => { const c = document.querySelector('.cm-scroller'); return c.scrollWidth <= c.clientWidth + 1 }), '長い行は折り返す')
+  // 太字の途中にもカーソルを置ける(前の版は太字・リンク全体を飛ばしていた)
+  await page.keyboard.press('Enter')
+  await page.keyboard.type('前**太字**後')
+  // 後 → ** → ** と戻ると「字」のうしろ(記号の見えている行なので1文字ずつ動ける)
+  for (let k = 0; k < 3; k++) await page.keyboard.press('ArrowLeft')
+  await page.keyboard.type('X')
+  await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })
+  check(read('はじめに.md').includes('前**太字X**後'), '太字の文字の途中にもカーソルを置いて書ける')
+
+  // リンク: [[メモ]] はそのノートを開く、URL は新しいタブ
+  const popup = page.waitForEvent('popup', { timeout: 5000 }).catch(() => null)
+  await page.click('.cm-lp-link[data-href="https://example.com/x"]')
+  const tab = await popup
+  check(tab && tab.url().startsWith('https://example.com/x'), 'URL を押すと新しいタブで開く')
+  if (tab) await tab.close()
+  await page.click('.cm-lp-wikilink[data-note="メモ"]')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'メモ')
+  check(true, '[[メモ]] を押すと、そのノート(sub/メモ.md)を開く')
+  await page.goBack()
+  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'はじめに')
+  check(true, 'ブラウザの「戻る」で前のノートへ')
+
+  // 三点メニュー
+  await page.click('button[aria-label="ノートのメニュー"]')
+  check(await page.isVisible('.dropdown button:has-text("Obsidian で開く")'), '三点メニューが開く(Obsidian で開く・パスをコピー など)')
+  await page.click('.dropdown button:has-text("Notion表示")')
+  check((await page.locator('.mode-switch button.selected').textContent()).includes('Notion'), '三点メニューから表示を切りかえ')
+
+  // Notion表示: 改行すると候補
   await page.click('.cm-content')
   await page.keyboard.press('Control+End')
-  // (前の行はリストの続きなので、1回目の Enter は「- 」が続き、2回目でリストを抜けて空の行になる)
   await page.keyboard.press('Enter')
-  await page.keyboard.press('Enter')
-  check(await page.isVisible('.command-menu'), 'Notion表示: 改行して空の行になると候補が出る(リストを抜けたときも)')
+  check(await page.isVisible('.command-menu'), 'Notion表示: 改行すると候補が出る')
   await page.keyboard.type('ふつうの文')
   check(!(await page.isVisible('.command-menu')), 'Notion表示: そのまま書くと候補は消える')
   await page.keyboard.press('Enter')
   for (let k = 0; k < 8; k++) await page.keyboard.press('ArrowDown')
   await page.keyboard.press('Enter')
   await page.keyboard.type('引用にした')
-  await page.waitForSelector('.save-indicator.saved', { timeout: 10000 })
-  check(readFileSync(join(vault, 'はじめに.md'), 'utf8').includes('ふつうの文\n> 引用にした'), 'Notion表示: 候補から「引用」を選ぶと > になる')
-  check((await page.locator('.cm-line.cm-lp-quote', { hasText: '引用にした' }).textContent()).includes('>') === false, 'Notion表示: 記号はいつも隠す')
-  await page.screenshot({ path: join(work, 'live.png'), fullPage: true })
-  console.log('スクショ: ' + join(work, 'live.png'))
+  await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })
+  check(read('はじめに.md').includes('ふつうの文\n> 引用にした'), 'Notion表示: 候補から「引用」を選ぶと > になる')
   await page.click('.mode-switch button:has-text("Obsidian")')
 
-  // API を止めても入力でき、保存済みにならない → 再起動で自動で再送される
+  // [[ でノート名の候補
+  await page.click('.cm-content')
+  await page.keyboard.press('Control+End')
+  await page.keyboard.press('Enter')
+  await page.keyboard.press('Enter')
+  await page.keyboard.type('[[')
+  await page.waitForSelector('.cm-tooltip-autocomplete', { timeout: 5000 })
+  await page.keyboard.type('メ')
+  await page.waitForSelector('.cm-completionLabel:has-text("メモ")', { timeout: 5000 })
+  await page.waitForTimeout(200) // 出た直後(75ms)は確定できない作り
+  await page.keyboard.press('Enter')
+  await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })
+  check(read('はじめに.md').trimEnd().endsWith('[[メモ]]'), '[[ でノート名の候補が出て、選ぶと [[メモ]] になる')
+
+  // Ctrl+K で本文を探す
+  await page.keyboard.press('Control+k')
+  await page.fill('.switcher-input input', 'CRLF')
+  await page.waitForSelector('.switcher-item em', { timeout: 5000 })
+  check((await page.textContent('.switcher-item em')).includes('CRLF'), 'Ctrl+K: 本文から探せて、前後の文が出る')
+  await page.keyboard.press('Enter')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'メモ')
+
+  // タグ
+  await page.waitForSelector('.tag-chip:has-text("#test")')
+  await page.click('.tag-chip:has-text("#test")')
+  await page.waitForSelector('.switcher-item:has-text("はじめに")', { timeout: 5000 })
+  check(true, 'タグを押すと、そのタグのノートが出る(Frontmatter のタグ)')
+  await page.keyboard.press('Escape')
+
+  // CRLF のノートは CRLF のまま
+  await page.click('.cm-content')
+  await page.keyboard.press('Control+End')
+  await page.keyboard.type('追加')
+  await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })
+  const crlf = read('sub/メモ.md')
+  check(crlf.includes('追加') && !/[^\r]\n/.test(crlf), 'CRLF のノートは CRLF のまま')
+
+  // 新しいノート(Alt+N)
+  await page.keyboard.press('Alt+n')
+  await page.fill('.modal input', '新規ノート')
+  await page.click('.modal button[type="submit"]')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === '新規ノート')
+  check(existsSync(join(vault, 'sub', '新規ノート.md')), 'Alt+N: 今のフォルダ(sub)に新しいノートを作って開く')
+
+  // API を止めても書ける → 保存済みにならない → 戻ると自動で送る
+  await page.click('.note-item:has-text("はじめに")')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'はじめに')
   await stopApi()
+  await page.click('.cm-content')
+  await page.keyboard.press('Control+End')
   await page.keyboard.press('Enter')
   await page.keyboard.type('止まっている間の入力')
-  await page.waitForTimeout(1500)
-  const label = await page.textContent('.save-indicator')
-  check(!/保存済み/.test(label), `API 停止中は保存済みにならない(${label.trim()})`)
-  // (画面も API が配っているので、止まっている間は再読み込みできない。開いたまま待つ)
+  await page.waitForSelector('.save-indicator.s-unsaved, .save-indicator.s-offline', { timeout: 10000 })
+  check(!(await page.isVisible('.save-indicator.s-saved')), `API 停止中は保存済みにならない(${(await page.textContent('.save-indicator')).trim()})`)
+  check(await page.waitForSelector('.status-strip', { timeout: 10000 }).then(() => true, () => false), 'つながらないことを文で知らせる')
   check(await startApi(), 'API を再起動')
-  const resent = await waitFor(() => readFileSync(join(vault, 'はじめに.md'), 'utf8').includes('止まっている間の入力'), 30000)
-  check(resent, '再接続後、送信待ちが自動で再送される')
+  check(await waitFor(() => read('はじめに.md').includes('止まっている間の入力'), 30000), '再接続後、自動で送り直す')
+  await page.waitForSelector('.save-indicator.s-saved', { timeout: 30000 })
 
-  // 開き直すと最新が表示される
+  // 再読み込みしても同じノート
   await page.reload()
-  await page.click('.note-item:has-text("はじめに")')
-  await page.waitForSelector('.cm-content')
-  check(!(await page.isVisible('.sidebar')), 'スマホ幅ではノートを開くと一覧が閉じる')
-  check((await page.textContent('.cm-content')).includes('止まっている間の入力'), '開き直しても内容が残る')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'はじめに')
+  check((await page.textContent('.cm-content')).includes('止まっている間の入力'), '再読み込みしても同じノートが開き、内容も最新')
 
-  // ほかの場所(Obsidian など)での変更 → 競合、どちらも消えない
+  // ほかの場所での変更 → 競合。どちらも消えない
   writeFileSync(join(vault, 'はじめに.md'), '# はじめに\n\nObsidian で書きかえた\n')
   await page.click('.cm-content')
   await page.keyboard.press('Control+End')
   await page.keyboard.type('ブラウザ側の入力')
   await page.waitForSelector('.conflict-banner', { timeout: 10000 })
-  check(readFileSync(join(vault, 'はじめに.md'), 'utf8') === '# はじめに\n\nObsidian で書きかえた\n', '競合: サーバーのファイルは上書きされない')
+  check(read('はじめに.md') === '# はじめに\n\nObsidian で書きかえた\n', '競合: サーバーのファイルは上書きされない')
+  await page.click('.conflict-banner button:has-text("差分を見る")')
+  check((await page.textContent('.diff')).includes('+ ') && (await page.textContent('.diff')).includes('Obsidian で書きかえた'), '競合: 差分が見られる')
+  await page.click('.modal button[aria-label="閉じる"]')
   await page.click('.conflict-banner button:has-text("別名で保存")')
-  await page.waitForSelector('.notice')
+  await page.waitForFunction(() => (document.querySelector('.cm-content')?.textContent || '').includes('Obsidian で書きかえた'))
   const copy = readdirSync(vault).find((f) => f.includes('競合'))
-  check(copy && readFileSync(join(vault, copy), 'utf8').includes('ブラウザ側の入力'), `競合: 自分の下書きを別名で保存(${copy})`)
+  check(copy && read(copy).includes('ブラウザ側の入力'), `競合: 自分の版を別名で保存(${copy})し、ノートはサーバーの版に`)
+  await page.screenshot({ path: join(work, 'desktop.png') })
 
-  // CRLF のノートは CRLF のまま
-  await page.click('.mobile-menu')
-  await page.click('.note-item:has-text("メモ")')
-  await page.waitForSelector('.cm-content')
-  await page.click('.cm-content')
-  await page.keyboard.press('Control+End')
-  await page.keyboard.type('追加')
-  await page.waitForSelector('.save-indicator.saved', { timeout: 10000 })
-  const crlf = readFileSync(join(vault, 'sub', 'メモ.md'), 'utf8')
-  check(crlf.includes('追加') && !/[^\r]\n/.test(crlf), 'CRLF のノートは CRLF のまま保存')
-  await page.screenshot({ path: join(work, 'mobile.png') })
-  console.log('スクショ: ' + join(work, 'mobile.png'))
+  // スマホ幅: 一覧は閉じていて、開いてノートを選ぶと閉じる
+  const m = await browser.newPage({ viewport: { width: 390, height: 844 } })
+  m.on('pageerror', (e) => errors.push(e.message))
+  await m.route(/fonts\./, (r) => r.abort())
+  await m.goto(base + '/#/' + encodeURI('はじめに.md'))
+  await m.waitForSelector('.cm-content')
+  check(!(await m.isVisible('.sidebar')), 'スマホ幅: はじめは一覧を閉じている')
+  await m.click('button[aria-label="一覧を開く・閉じる"]')
+  await m.click('.tree-folder:has-text("sub")').catch(() => {})
+  await m.click('.note-item:has-text("メモ")')
+  await m.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'メモ')
+  check(!(await m.isVisible('.sidebar')), 'スマホ幅: ノートを選ぶと一覧が閉じる')
+  await m.screenshot({ path: join(work, 'mobile.png') })
+  console.log('スクショ: ' + work)
   check(errors.length === 0, `ブラウザのエラーなし ${errors.slice(0, 3).join(' / ')}`)
 } catch (e) {
   console.error(e)
   failed = true
 } finally {
   await browser.close()
-  if (api && api.exitCode === null) await stopApi()
+  if (apiProc && apiProc.exitCode === null) await stopApi()
+  if (!failed && !process.env.KEEP) rmSync(work, { recursive: true, force: true })
 }
 process.exit(failed ? 1 : 0)

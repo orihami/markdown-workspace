@@ -103,3 +103,26 @@ def test_health_writes_nothing(client, vault):
     before = sorted(os.listdir(vault))
     assert client.get("/api/health").json()["ok"] is True
     assert sorted(os.listdir(vault)) == before
+
+
+def test_tags_from_frontmatter_and_body(client, vault):
+    (vault / "b.md").write_text("---\ntags: [alpha, beta]\n---\n本文 #gamma と #project/keyboard\n```\n#not-a-tag\n```\n# 見出し\n`#nope`\n", encoding="utf-8")
+    items = {i["tag"]: i["count"] for i in client.get("/api/tags").json()["items"]}
+    assert items["x"] == 1  # a.md の Frontmatter(リスト形式)
+    assert {"alpha", "beta", "gamma", "project/keyboard"} <= set(items)
+    assert "not-a-tag" not in items and "nope" not in items and "見出し" not in items
+
+
+def test_search_name_first_with_snippet(client, vault):
+    (vault / "検索.md").write_text("ほかの文", encoding="utf-8")
+    (vault / "c.md").write_text("ここに 検索 という言葉がある", encoding="utf-8")
+    items = client.get("/api/search", params={"q": "検索"}).json()["items"]
+    assert items[0]["path"] == "検索.md"
+    assert any(i["path"] == "c.md" and "検索" in i["snippet"] for i in items)
+
+
+def test_search_by_tag(client, vault):
+    (vault / "d.md").write_text("本文 #project/keyboard\n", encoding="utf-8")
+    (vault / "e.md").write_text("---\ntags:\n  - project\n---\n", encoding="utf-8")
+    paths = [i["path"] for i in client.get("/api/search", params={"tag": "project"}).json()["items"]]
+    assert paths == ["d.md", "e.md"]

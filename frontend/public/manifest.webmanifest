@@ -1,0 +1,9 @@
+{
+  "name": "memo workspace",
+  "short_name": "memo",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#6d4fe6",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}

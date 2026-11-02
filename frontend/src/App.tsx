@@ -1,48 +1,23 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import CodeMirror from '@uiw/react-codemirror'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import CodeMirror, { ReactCodeMirrorRef } from '@uiw/react-codemirror'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorView, keymap } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
-import { livePreview } from './livePreview'
-import { BookOpen, ChevronDown, FilePlus2, FileText, Hash, Menu, MoreHorizontal, Search, Settings2, Wifi, WifiOff, Sparkles, Command, PenLine } from 'lucide-react'
-import { enqueueSave, getDraft, listQueue, removeQueueUpTo, saveDraft } from './storage'
+import { AlertTriangle, BookOpen, Check, CircleDot, CloudOff, Command, FilePlus2, Hash, Loader2, Menu, MoreHorizontal, PenLine, Search, Settings2, Sparkles, Wifi, WifiOff, X } from 'lucide-react'
+import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
+import { engine, SaveStatus, STATUS_LABEL } from './sync'
+import { livePreview, LiveMode } from './livePreview'
+import { workspaceCompletions } from './completions'
+import { buildTree, DiffDialog, Dropdown, folderList, MenuItem, NewNoteDialog, QuickSwitcher, Tree } from './components'
 
-type Note = { path: string; name: string; modified_at?: string; size?: number }
-type NoteResponse = { path: string; content: string; etag: string }
-// source: Markdown をそのまま見て書く / obsidian: Obsidian のライブプレビュー(カーソルの行だけ記号が見える)
-// notion: 記号はいつも隠し、改行するたびにブロックの候補を出す。どれもファイルの中身は変えない(見た目だけ)
-type Presentation = 'source' | 'obsidian' | 'notion'
-const PRESENTATIONS: Presentation[] = ['obsidian', 'notion', 'source']
-const PRESENTATION_KEY = 'editor.presentation'
-
-const DEMO = `---
-tags:
-  - ideas
-  - workspace
----
-
-# 新しいワークスペース
-
-Obsidianの使いやすさと、Notionの見やすさを組み合わせる。
-
-## 設計のポイント
-
-- **入力はローカルで即時反映**
-- NAS上のMarkdownを唯一の正本にする
-- 通信が切れても下書きを保持する
-
-> 保存の遅さを、入力の遅さにしない。
-
-## リンク
-
-[Markdown Guide](https://www.markdownguide.org/)
-
-\`\`\`text
-/ を入力するとコマンド候補が表示される
-\`\`\`
-`
-
-const notePath = (path: string) => '/api/notes/' + path.split('/').map(encodeURIComponent).join('/')
+// 表示(仕様 4.3)。どれも同じエディタで直接書き、ファイルの中身は変えない(見た目だけ)
+//   obsidian: ライブプレビュー(カーソルの行だけ記号が見える) / notion: 記号を隠し、改行で候補 / source: 記号をそのまま
+type Presentation = LiveMode
+const PRESENTATIONS: { id: Presentation; label: string }[] = [
+  { id: 'obsidian', label: 'Obsidian表示' },
+  { id: 'notion', label: 'Notion表示' },
+  { id: 'source', label: 'ソース' },
+]
 
 const commands = [
   { label: 'テキスト', hint: '', icon: 'T' },
@@ -57,267 +32,203 @@ const commands = [
   { label: '区切り線', hint: '---', icon: '—' },
 ]
 
-async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...init,
-    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
-  })
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}))
-    const error = new Error(body.detail || `HTTP ${response.status}`) as Error & { status?: number; body?: any }
-    error.status = response.status
-    error.body = body
-    throw error
-  }
-  return response.json()
+const load = (key: string, def: string) => { try { return localStorage.getItem(key) ?? def } catch { return def } }
+const store = (key: string, value: string) => { try { localStorage.setItem(key, value) } catch { /* 保存できなくても動く */ } }
+const isMobile = () => window.matchMedia('(max-width: 760px)').matches
+const folderOf = (path: string) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '')
+const nameOf = (path: string) => path.split('/').pop()!.replace(/\.md$/i, '')
+const hashPath = () => { try { return decodeURIComponent(location.hash.replace(/^#\/?/, '')) } catch { return '' } }
+
+const STATUS_ICON: Record<SaveStatus, JSX.Element> = {
+  saved: <Check size={13} />,
+  saving: <Loader2 size={13} className="spin" />,
+  unsaved: <CircleDot size={13} />,
+  offline: <CloudOff size={13} />,
+  conflict: <AlertTriangle size={13} />,
+  error: <AlertTriangle size={13} />,
 }
 
 export default function App() {
+  useSyncExternalStore(engine.subscribe, () => engine.version)
   const [notes, setNotes] = useState<Note[]>([])
-  const [activePath, setActivePath] = useState('')
-  const [content, setContent] = useState(DEMO)
-  const [etag, setEtag] = useState<string | null>(null)
-  const [presentation, setPresentation] = useState<Presentation>(() => {
-    const saved = localStorage.getItem(PRESENTATION_KEY) as Presentation
-    return PRESENTATIONS.includes(saved) ? saved : 'obsidian'
-  })
-  const [saveState, setSaveState] = useState('デモ表示')
+  const [tags, setTags] = useState<TagCount[]>([])
+  const [apiOk, setApiOk] = useState<boolean | null>(null)
   const [online, setOnline] = useState(navigator.onLine)
-  const [query, setQuery] = useState('')
+  const [active, setActive] = useState('')
+  const [doc, setDoc] = useState<{ path: string; content: string; seq: number } | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [presentation, setPresentation] = useState<Presentation>(() => {
+    const saved = load('editor.presentation', 'obsidian') as Presentation
+    return PRESENTATIONS.some((p) => p.id === saved) ? saved : 'obsidian'
+  })
+  const [sidebarOpen, setSidebarOpen] = useState(() => !isMobile())
+  const [filter, setFilter] = useState('')
+  const [openFolders, setOpenFolders] = useState<Set<string>>(() => { try { return new Set(JSON.parse(load('tree.open', '[]'))) } catch { return new Set() } })
+  const [tagsOpen, setTagsOpen] = useState(() => load('tags.open', '1') === '1')
+  const [switcher, setSwitcher] = useState<string | null>(null)
+  const [newNote, setNewNote] = useState<{ folder: string; name: string } | null>(null)
+  const [noteMenu, setNoteMenu] = useState(false)
+  const [settings, setSettings] = useState(false)
+  const [diff, setDiff] = useState<{ mine: string; server: string } | null>(null)
+  const [notice, setNotice] = useState('')
+  const [vaultName, setVaultName] = useState(() => load('obsidian.vault', 'OMNI'))
+
+  const editorRef = useRef<ReactCodeMirrorRef>(null)
+  const notesRef = useRef(notes)
+  notesRef.current = notes
+  const tagsRef = useRef(tags)
+  tagsRef.current = tags
+  const activeRef = useRef(active)
+  activeRef.current = active
+  const contentRef = useRef('')
+  const openSeq = useRef(0)
+
+  const sync = active ? engine.get(active) : null
+  const tree = useMemo(() => buildTree(notes), [notes])
+  const folders = useMemo(() => folderList(notes), [notes])
+
+  // ---- サーバーから一覧・タグ ----
+  const loadTree = useCallback(async () => {
+    try {
+      const r = await api<{ items: Note[] }>('/api/tree')
+      setNotes(r.items)
+      setApiOk(true)
+    } catch {
+      setApiOk(false)
+    }
+  }, [])
+  const loadTags = useCallback(async () => {
+    try { setTags((await api<{ items: TagCount[] }>('/api/tags')).items) } catch { /* あとで */ }
+  }, [])
+
+  // ---- ノートを開く ----
+  const openNote = useCallback(async (path: string, opts: { push?: boolean } = {}) => {
+    const seq = ++openSeq.current
+    setLoading(true)
+    setNoteMenu(false)
+    try {
+      const r = await api<NoteResponse>(notePath(path))
+      const { content, restored } = await engine.open(path, r.content, r.etag)
+      if (seq !== openSeq.current) return
+      setActive(path)
+      contentRef.current = content
+      setDoc({ path, content, seq: Date.now() })
+      setNotice(restored ? '送れていなかった変更を復元しました。つながりしだい送ります' : '')
+      store('last.note', path)
+      if (opts.push !== false && hashPath() !== path) history.pushState(null, '', '#/' + encodeURI(path))
+      // そのノートのフォルダを開いておく
+      setOpenFolders((prev) => {
+        const next = new Set(prev)
+        const parts = path.split('/')
+        for (let i = 1; i < parts.length; i++) next.add(parts.slice(0, i).join('/'))
+        return next
+      })
+      if (isMobile()) setSidebarOpen(false)
+    } catch (e) {
+      if (seq !== openSeq.current) return
+      const err = e as ApiError
+      if (err.status === 404) setNotice(`「${path}」は見つかりませんでした(移動・削除されたかもしれません)`)
+      else if (err.network) {
+        // サーバーに届かないときでも、端末に残した送信待ちがあればそれを開く
+        const mine = await engine.mineContent(path)
+        if (mine !== null) {
+          setActive(path)
+          contentRef.current = mine
+          setDoc({ path, content: mine, seq: Date.now() })
+          setNotice('サーバーにつながらないので、端末に残っている内容を開きました。書いた分はつながりしだい送ります')
+        } else setNotice('サーバーにつながらないので、ノートを開けません')
+      } else setNotice(`ノートを開けません: ${err.message}`)
+    } finally {
+      if (seq === openSeq.current) setLoading(false)
+    }
+  }, [])
+
+  // 起動: 送信待ちの再送・一覧・URL(#/パス)か前回のノートを開く
+  useEffect(() => {
+    void engine.start()
+    void loadTree()
+    void loadTags()
+    const first = hashPath() || load('last.note', '')
+    if (first) void openNote(first, { push: !hashPath() })
+    const onHash = () => { const p = hashPath(); if (p && p !== activeRef.current) void openNote(p, { push: false }) }
+    window.addEventListener('popstate', onHash)
+    const up = () => setOnline(true)
+    const down = () => setOnline(false)
+    window.addEventListener('online', up)
+    window.addEventListener('offline', down)
+    // つながっているかを時々確かめる
+    const health = setInterval(async () => {
+      try { await api('/api/health', {}, 6000); setApiOk(true) } catch { setApiOk(false) }
+    }, 20000)
+    return () => {
+      window.removeEventListener('popstate', onHash)
+      window.removeEventListener('online', up)
+      window.removeEventListener('offline', down)
+      clearInterval(health)
+    }
+  }, [loadTree, loadTags, openNote])
+
+  // ---- 新しいノート ----
+  const openNewNote = useCallback((name = '', folder?: string) => {
+    setSwitcher(null)
+    setNewNote({ folder: folder ?? folderOf(activeRef.current), name })
+  }, [])
+  const createNote = async (folder: string, name: string, content = ''): Promise<string | null> => {
+    const path = `${folder ? folder + '/' : ''}${name}.md`
+    try {
+      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content }) })
+    } catch (e) {
+      const err = e as ApiError
+      return err.status === 409 ? '同じ名前のノートがもうあります' : err.network ? 'サーバーにつながりません' : `作れませんでした: ${err.message}`
+    }
+    setNewNote(null)
+    await loadTree()
+    await openNote(path)
+    return null
+  }
+
+  // ---- リンクを押したとき ----
+  const resolveNote = (target: string): Note | undefined => {
+    const t = target.replace(/\.md$/i, '').toLowerCase()
+    const list = notesRef.current
+    const here = folderOf(activeRef.current)
+    return list.find((n) => n.path.replace(/\.md$/i, '').toLowerCase() === t)
+      || list.find((n) => folderOf(n.path) === here && n.name.toLowerCase() === t)
+      || list.find((n) => n.name.toLowerCase() === t)
+  }
+  const linkRef = useRef<(kind: 'url' | 'note', target: string) => void>(() => {})
+  linkRef.current = (kind, target) => {
+    if (kind === 'url') {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(target)) { window.open(target, '_blank', 'noopener'); return }
+      // 相対パスの .md リンクは、このワークスペースのノートとして開く
+      const rel = decodeURIComponent(target.split('#')[0])
+      const base = folderOf(activeRef.current)
+      const joined = (base ? base + '/' : '') + rel
+      const parts: string[] = []
+      for (const p of joined.split('/')) { if (p === '..') parts.pop(); else if (p && p !== '.') parts.push(p) }
+      const found = resolveNote(parts.join('/'))
+      if (found) void openNote(found.path)
+      else setNotice(`リンク先が見つかりません: ${target}`)
+      return
+    }
+    const found = resolveNote(target)
+    if (found) void openNote(found.path)
+    else openNewNote(target.split('/').pop() || target, folderOf(activeRef.current))
+  }
+
+  // ---- ブロックの候補(/ と、Notion表示の改行) ----
   const [showCommands, setShowCommands] = useState(false)
   const [commandIndex, setCommandIndex] = useState(0)
-  // slash: / を打ったとき / block: Notion表示で改行したとき(何も選ばずに書きはじめてもよい)
   const [menuKind, setMenuKind] = useState<'slash' | 'block'>('slash')
   const [menuPos, setMenuPos] = useState({ top: 0, left: 0 })
   const wrapRef = useRef<HTMLDivElement>(null)
-  const menuLineRef = useRef(-1) // 候補を開いた行(ほかの行へ移ったら閉じる)
-  const enterRef = useRef(false) // いま Enter が押された(リストを抜けたときも候補を出すため)
-  const [showSettings, setShowSettings] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(true)
-  const [apiReady, setApiReady] = useState(false)
-  const [conflict, setConflict] = useState<any>(null)
-  const [notice, setNotice] = useState('')
-  const editorRef = useRef<any>(null)
-  const timerRef = useRef<number | undefined>(undefined)
-  const skipNextSaveRef = useRef(false)
-  const etagRef = useRef<string | null>(null)
-  const etagsRef = useRef<Record<string, string | null>>({})
-  const saveChainRef = useRef<Promise<void>>(Promise.resolve())
-  const activePathRef = useRef(activePath)
-  activePathRef.current = activePath
-  const retryingRef = useRef(false)
-  const retryDelayRef = useRef(2000)
+  const menuLineRef = useRef(-1)
+  const enterRef = useRef(false)
+  const menuRef = useRef({ open: false, index: 0, kind: 'slash' as 'slash' | 'block' })
+  menuRef.current = { open: showCommands, index: commandIndex, kind: menuKind }
 
-  const filteredNotes = useMemo(() => notes.filter(n => `${n.name} ${n.path}`.toLowerCase().includes(query.toLowerCase())), [notes, query])
-
-  const refreshTree = useCallback(async () => {
-    try {
-      const result = await api<{ items: Note[] }>('/api/tree')
-      setNotes(result.items)
-      setApiReady(true)
-    } catch {
-      setApiReady(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    refreshTree()
-    const onlineHandler = () => setOnline(true)
-    const offlineHandler = () => setOnline(false)
-    window.addEventListener('online', onlineHandler)
-    window.addEventListener('offline', offlineHandler)
-    return () => {
-      window.removeEventListener('online', onlineHandler)
-      window.removeEventListener('offline', offlineHandler)
-    }
-  }, [refreshTree])
-
-  const openNote = useCallback(async (path: string) => {
-    try {
-      const result = await api<NoteResponse>(notePath(path))
-      const local = await getDraft(path)
-      setActivePath(path)
-      // スマホ幅では一覧が本文の上にかぶるので、ノートを開いたら閉じる
-      if (window.matchMedia('(max-width: 760px)').matches) setSidebarOpen(false)
-      // サーバーの保存確認がまだの下書きは、古くても必ず復元する(仕様 6.5)。
-      // 保存済みの下書きは使わない(ほかの端末・Obsidian での変更を古い内容で戻さないため)
-      const restoredContent = local && local.dirty !== false ? local.content : result.content
-      const hasLocalChanges = restoredContent !== result.content
-      // Preserve the draft's original server ETag. If the server changed while this
-      // draft was offline, the next PUT must conflict instead of overwriting it.
-      const baseEtag = hasLocalChanges ? (local?.baseEtag ?? null) : result.etag
-      setEtag(result.etag)
-      etagRef.current = baseEtag
-      etagsRef.current[path] = baseEtag
-      skipNextSaveRef.current = !hasLocalChanges
-      setContent(restoredContent)
-      setSaveState(hasLocalChanges ? 'ローカル下書き' : '保存済み')
-      setConflict(null)
-      if (hasLocalChanges) setNotice('未送信のローカル下書きを復元しました')
-      else setNotice('')
-    } catch (error) {
-      setNotice('ノートを開けませんでした。API接続を確認してください。')
-    }
-  }, [])
-
-  useEffect(() => {
-    if (!activePath) return
-    if (skipNextSaveRef.current) {
-      skipNextSaveRef.current = false
-      void saveDraft({ path: activePath, content, baseEtag: etagsRef.current[activePath] ?? etagRef.current, updatedAt: Date.now(), dirty: false })
-      return
-    }
-    void saveDraft({ path: activePath, content, baseEtag: etagsRef.current[activePath] ?? etagRef.current, updatedAt: Date.now(), dirty: true })
-    setSaveState('未保存')
-    window.clearTimeout(timerRef.current)
-    timerRef.current = window.setTimeout(() => {
-      saveChainRef.current = saveChainRef.current.then(() => sendSave(activePath, content)).catch(() => undefined)
-    }, 550)
-    return () => window.clearTimeout(timerRef.current)
-  }, [content, activePath]) // save is deliberately debounced after local draft persistence
-
-  const sendSave = async (path: string, nextContent: string) => {
-    if (!path) return
-    const mutationId = crypto.randomUUID()
-    const baseEtag = etagsRef.current[path] ?? etagRef.current
-    const createdAt = Date.now()
-    await enqueueSave({ id: mutationId, path, content: nextContent, baseEtag, createdAt })
-    if (!navigator.onLine) {
-      setSaveState('オフライン・未保存')
-      return
-    }
-    setSaveState('保存中')
-    try {
-      const result = await api<{ etag: string }>(notePath(path), {
-        method: 'PUT',
-        body: JSON.stringify({ content: nextContent, base_etag: baseEtag, mutation_id: mutationId }),
-      })
-      // これより古い送信待ちは、あとから送ると新しい内容を古い内容で戻してしまうので消す
-      await removeQueueUpTo(path, createdAt)
-      etagsRef.current[path] = result.etag
-      await markSaved(path, nextContent, result.etag)
-      if (activePathRef.current !== path) return
-      setEtag(result.etag)
-      etagRef.current = result.etag
-      setSaveState('保存済み')
-      setNotice('')
-      void refreshTree()
-    } catch (error: any) {
-      if (error.status === 409) {
-        setConflict(error.body)
-        setSaveState('競合')
-      } else {
-        setSaveState(error.status ? `エラー(${error.status})・再送待ち` : '未保存・再送待ち')
-      }
-    }
-  }
-
-  // サーバーが保存を確認した内容は、下書きを「保存済み」にする(まだ入力が続いていれば dirty のまま)
-  const markSaved = async (path: string, savedContent: string, savedEtag: string) => {
-    const local = await getDraft(path)
-    if (!local || local.content === savedContent) await saveDraft({ path, content: savedContent, baseEtag: savedEtag, updatedAt: Date.now(), dirty: false })
-    else await saveDraft({ ...local, baseEtag: savedEtag })
-  }
-
-  // 送信待ちを再送する。ノートごとにいちばん新しい内容だけを送る(古い内容で上書きしないため)
-  const retryQueue = useCallback(async () => {
-    if (!navigator.onLine || retryingRef.current) return
-    retryingRef.current = true
-    try {
-      const queue = await listQueue()
-      const latest = new Map<string, (typeof queue)[number]>()
-      for (const item of queue) latest.set(item.path, item)
-      let failed = false
-      for (const item of latest.values()) {
-        try {
-          const result = await api<{ etag: string }>(notePath(item.path), {
-            method: 'PUT',
-            body: JSON.stringify({ content: item.content, base_etag: etagsRef.current[item.path] ?? item.baseEtag, mutation_id: item.id }),
-          })
-          await removeQueueUpTo(item.path, item.createdAt)
-          etagsRef.current[item.path] = result.etag
-          await markSaved(item.path, item.content, result.etag)
-          if (activePathRef.current === item.path) { setEtag(result.etag); etagRef.current = result.etag }
-        } catch (error: any) {
-          failed = true
-          if (error.status === 409 && activePathRef.current === item.path) {
-            setConflict(error.body)
-            setSaveState('競合')
-          }
-          if (!error.status) break
-        }
-      }
-      if (!failed) {
-        retryDelayRef.current = 2000
-        if (queue.length && (await listQueue()).length === 0) { setSaveState('保存済み'); void refreshTree() }
-      } else retryDelayRef.current = Math.min(retryDelayRef.current * 2, 60000)
-    } finally {
-      retryingRef.current = false
-    }
-  }, [refreshTree])
-
-  // 起動時・通信が戻ったとき、そのあとも送信待ちがあれば間隔をのばしながら再送する(仕様 6.1 の 7)
-  useEffect(() => {
-    if (!online) return
-    let timer: number | undefined
-    const loop = async () => {
-      await retryQueue()
-      if (!(await listQueue()).length) retryDelayRef.current = 2000
-      timer = window.setTimeout(loop, retryDelayRef.current)
-    }
-    void loop()
-    return () => window.clearTimeout(timer)
-  }, [online, retryQueue])
-
-  const createNote = async () => {
-    const title = window.prompt('ノート名')
-    if (!title?.trim()) return
-    const path = `${title.trim().replace(/[\\/:*?"<>|]/g, '-')}.md`
-    try {
-      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content: `# ${title.trim()}\n\n` }) })
-      await refreshTree()
-      await openNote(path)
-    } catch {
-      setNotice('作成できませんでした。同名ノートがないか確認してください。')
-    }
-  }
-
-  // 競合: 自分の下書きを同じフォルダに別名のノートとして保存する(どちらの内容も消さない)
-  const saveConflictCopy = async () => {
-    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '-')
-    const dir = activePath.includes('/') ? activePath.slice(0, activePath.lastIndexOf('/') + 1) : ''
-    const path = `${dir}${title} (競合 ${stamp}).md`
-    try {
-      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content }) })
-      await refreshTree()
-      setNotice(`自分の下書きを「${path}」として保存しました`)
-      loadServerVersion()
-    } catch {
-      const blob = new Blob([content], { type: 'text/markdown' })
-      const a = document.createElement('a')
-      a.href = URL.createObjectURL(blob)
-      a.download = `${title}-local-conflict.md`
-      a.click()
-      URL.revokeObjectURL(a.href)
-      setNotice('サーバーに別名保存できなかったので、下書きをファイルとしてダウンロードしました')
-    }
-  }
-
-  const loadServerVersion = () => {
-    if (!conflict) return
-    etagRef.current = conflict.server_etag
-    etagsRef.current[activePath] = conflict.server_etag
-    setEtag(conflict.server_etag)
-    skipNextSaveRef.current = true
-    setContent(conflict.server_content ?? content)
-    setConflict(null)
-    setSaveState('保存済み')
-    void removeQueueUpTo(activePath, Date.now())
-  }
-
-  // 候補を選んだとき: 今の行を見出し・リストなどにする(/ で開いたときはその / を消す)
   const applyBlock = (hint: string) => {
-    const view: EditorView | undefined = editorRef.current?.view
+    const view = editorRef.current?.view
     if (!view) return
     const head = view.state.selection.main.head
     const line = view.state.doc.lineAt(head)
@@ -338,7 +249,6 @@ export default function App() {
       insert = body ? body + '\n---\n' : '---\n'
       cursor = insert.length
     } else {
-      // コードブロック: 中の行にカーソルを置く
       const before = body ? body + '\n' : ''
       insert = before + hint
       cursor = before.length + hint.indexOf('\n') + 1
@@ -347,12 +257,6 @@ export default function App() {
     view.focus()
     setShowCommands(false)
   }
-
-  const handleEditorChange = (value: string) => {
-    setContent(value)
-  }
-
-  // 入力のたびに、候補を出すかどうかを決める
   const openMenu = (view: EditorView, kind: 'slash' | 'block') => {
     const head = view.state.selection.main.head
     const at = view.coordsAtPos(head)
@@ -368,30 +272,16 @@ export default function App() {
       if (u.selectionSet && menuRef.current.open && u.state.doc.lineAt(u.state.selection.main.head).number !== menuLineRef.current) setShowCommands(false)
       return
     }
-    if (!u.transactions.some(t => t.isUserEvent('input') && !t.isUserEvent('input.block'))) return
-    const state = u.state
-    const head = state.selection.main.head
-    const line = state.doc.lineAt(head)
-    const before = state.doc.sliceString(line.from, head)
+    if (!u.transactions.some((t) => t.isUserEvent('input') && !t.isUserEvent('input.block'))) return
+    const head = u.state.selection.main.head
+    const line = u.state.doc.lineAt(head)
+    const before = u.state.doc.sliceString(line.from, head)
     const entered = enterRef.current
     enterRef.current = false
     if (/(^|\s)\/$/.test(before)) openMenu(u.view, 'slash')
     else if (presentation === 'notion' && entered && line.text.trim() === '') openMenu(u.view, 'block')
     else setShowCommands(false)
   }), [presentation])
-
-  const togglePresentation = (value: Presentation) => {
-    setPresentation(value)
-    setShowCommands(false)
-    localStorage.setItem(PRESENTATION_KEY, value)
-  }
-
-  const title = activePath ? activePath.split('/').pop()?.replace(/\.md$/i, '') : 'ワークスペースのプレビュー'
-
-  // 候補はキーボードで選べる(↑↓で選択、Enter/Tabで確定、Escで閉じる)。
-  // Notion表示で改行したときの候補は何も選んでいない状態で出るので、そのまま Enter や文字を打てば普通に書ける
-  const menuRef = useRef({ open: false, index: 0, kind: 'slash' as 'slash' | 'block' })
-  menuRef.current = { open: showCommands, index: commandIndex, kind: menuKind }
   const pick = () => {
     const { open, index } = menuRef.current
     enterRef.current = true
@@ -401,95 +291,228 @@ export default function App() {
     return true
   }
   const commandKeys = useMemo(() => Prec.highest(keymap.of([
-    { key: 'ArrowDown', run: () => { if (!menuRef.current.open) return false; setCommandIndex(i => (i + 1) % commands.length); return true } },
-    { key: 'ArrowUp', run: () => { if (!menuRef.current.open) return false; setCommandIndex(i => (i <= 0 ? commands.length - 1 : i - 1)); return true } },
+    { key: 'ArrowDown', run: () => { if (!menuRef.current.open) return false; setCommandIndex((i) => (i + 1) % commands.length); return true } },
+    { key: 'ArrowUp', run: () => { if (!menuRef.current.open) return false; setCommandIndex((i) => (i <= 0 ? commands.length - 1 : i - 1)); return true } },
     { key: 'Enter', run: () => pick() },
-    { key: 'Tab', run: () => pick() },
+    { key: 'Tab', run: () => { if (!menuRef.current.open || menuRef.current.index < 0) return false; return pick() } },
     { key: 'Escape', run: () => { if (!menuRef.current.open) return false; setShowCommands(false); return true } },
   ])), [])
+  const completions = useMemo(() => workspaceCompletions(() => notesRef.current, () => tagsRef.current), [])
   const extensions = useMemo(() => [
     markdown({ base: markdownLanguage }),
     EditorView.lineWrapping,
     commandKeys,
     menuListener,
-    ...(presentation === 'source' ? [] : [livePreview(presentation)]),
-  ], [presentation, commandKeys, menuListener])
-  const saveLabel = saveState === '保存済み' ? '保存済み' : saveState
+    completions,
+    livePreview(presentation, (k, t) => linkRef.current(k, t)),
+  ], [presentation, commandKeys, menuListener, completions])
+
+  const choosePresentation = (p: Presentation) => {
+    setPresentation(p)
+    setShowCommands(false)
+    store('editor.presentation', p)
+  }
+
+  // ---- キーボード(仕様 4.5) ----
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.ctrlKey || e.metaKey
+      const k = e.key.toLowerCase()
+      if (mod && k === 'k') { e.preventDefault(); void loadTree(); setSwitcher('') }
+      // Ctrl+N はブラウザが新しいウィンドウに使うことがあるので Alt+N でも
+      else if ((mod || e.altKey) && k === 'n') { e.preventDefault(); openNewNote() }
+      else if (mod && k === 's') { e.preventDefault(); engine.saveNow(activeRef.current || undefined) }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [loadTree, openNewNote])
+
+  // ---- 競合(仕様 6.4): 勝手にどちらかを捨てない ----
+  const showDiff = async () => {
+    const c = sync?.conflict
+    if (!c) return
+    setDiff({ mine: (await engine.mineContent(active)) ?? contentRef.current, server: c.serverContent ?? '' })
+  }
+  const copyMineThenUseServer = async () => {
+    const mine = (await engine.mineContent(active)) ?? contentRef.current
+    const stamp = new Date().toLocaleString('sv-SE').slice(0, 16).replace(/[-:]/g, '').replace(' ', '-')
+    const copyName = `${nameOf(active)} (競合 ${stamp})`
+    const err = await createNoteRaw(folderOf(active), copyName, mine)
+    if (err) { setNotice(`自分の版を別名で保存できませんでした: ${err}。ノートはそのままです`); return }
+    const server = await engine.useServer(active)
+    contentRef.current = server ?? ''
+    setDoc({ path: active, content: server ?? '', seq: Date.now() })
+    setNotice(`自分の版を「${copyName}」として保存し、このノートはサーバーの版にしました`)
+    void loadTree()
+  }
+  const keepMine = async () => {
+    if (!window.confirm('サーバーの版を、いま画面にある自分の版で上書きします。サーバー側の変更は消えます。よいですか？')) return
+    await engine.keepMine(active)
+  }
+  const createNoteRaw = async (folder: string, name: string, content: string) => {
+    try {
+      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path: `${folder ? folder + '/' : ''}${name}.md`, content }) })
+      return null
+    } catch (e) { return (e as ApiError).message }
+  }
+
+  // ---- 三点メニュー ----
+  const noteMenuItems: MenuItem[] = active ? [
+    { label: 'Obsidian で開く', onClick: () => { location.href = `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(active.replace(/\.md$/i, ''))}` } },
+    { label: 'パスをコピー', onClick: async () => { try { await navigator.clipboard.writeText(active); setNotice('パスをコピーしました') } catch { window.prompt('パス', active) } } },
+    { label: 'Markdown をダウンロード', onClick: () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([contentRef.current], { type: 'text/markdown' })); a.download = active.split('/').pop()!; a.click(); URL.revokeObjectURL(a.href) } },
+    { label: 'サーバーから読み直す', onClick: () => void openNote(active, { push: false }) },
+    'sep',
+    { label: 'このフォルダに新しいノート', onClick: () => openNewNote('', folderOf(active)) },
+    'sep',
+    ...PRESENTATIONS.map((p) => ({ label: `${presentation === p.id ? '✓ ' : '　'}${p.label}`, onClick: () => choosePresentation(p.id) })),
+  ] : []
+
+  const toggleFolder = (path: string) => setOpenFolders((prev) => {
+    const next = new Set(prev)
+    if (next.has(path)) next.delete(path); else next.add(path)
+    store('tree.open', JSON.stringify([...next]))
+    return next
+  })
+  const filtered = useMemo(() => {
+    const s = filter.trim().toLowerCase()
+    return s ? notes.filter((n) => n.path.toLowerCase().includes(s)).slice(0, 200) : []
+  }, [filter, notes])
+  const pending = engine.pending()
+  const connected = online && apiOk !== false
+  const recent = useMemo(() => [...notes].sort((a, b) => (b.modified_at || '').localeCompare(a.modified_at || '')).slice(0, 8), [notes])
+  const statusMsg = sync && sync.message && sync.status !== 'saved' && sync.status !== 'conflict' ? sync.message : ''
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand"><div className="brand-mark"><BookOpen size={17} /></div><span>memo</span><span className="brand-sub">workspace</span></div>
+        <div className="brand">
+          <button className="icon-button" onClick={() => setSidebarOpen((v) => !v)} aria-label="一覧を開く・閉じる"><Menu size={19} /></button>
+          <div className="brand-mark"><BookOpen size={17} /></div><span>memo</span>
+        </div>
+        <button className="top-search" onClick={() => { void loadTree(); setSwitcher('') }}><Search size={15} /><span>ノートを探す</span><kbd>Ctrl K</kbd></button>
         <div className="top-actions">
-          <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(v => !v)} aria-label="メニュー"><Menu size={18}/></button>
-          <div className="connection">{online && apiReady ? <Wifi size={14}/> : <WifiOff size={14}/>}<span>{apiReady ? (online ? '接続中' : 'オフライン') : 'API未接続'}</span></div>
-          <button className="icon-button" onClick={() => setShowSettings(v => !v)} aria-label="設定"><Settings2 size={18}/></button>
-          <button className="avatar">H</button>
+          <span className={`connection ${connected ? 'ok' : 'down'}`} title={connected ? 'サーバーにつながっています' : 'サーバーにつながっていません。書いた分は端末に残し、つながりしだい送ります'}>
+            {connected ? <Wifi size={14} /> : <WifiOff size={14} />}<span>{!online ? 'オフライン' : apiOk === false ? 'サーバー停止中' : '接続中'}</span>
+          </span>
+          <button className="icon-button" onClick={() => setSettings((v) => !v)} aria-label="設定"><Settings2 size={18} /></button>
         </div>
       </header>
 
       <div className="workspace">
+        {sidebarOpen && isMobile() && <div className="drawer-backdrop" onClick={() => setSidebarOpen(false)} />}
         {sidebarOpen && <aside className="sidebar">
-          <div className="workspace-label">WORKSPACE <ChevronDown size={13}/></div>
-          <button className="side-action" onClick={createNote}><FilePlus2 size={16}/>新しいノート</button>
-          <div className="search-box"><Search size={15}/><input value={query} onChange={e => setQuery(e.target.value)} placeholder="ノートを検索..." /></div>
-          <div className="section-label">ページ</div>
-          <div className="note-list">
-            {filteredNotes.map(note => <button key={note.path} className={`note-item ${activePath === note.path ? 'active' : ''}`} onClick={() => openNote(note.path)}><FileIcon/><span>{note.name}</span></button>)}
-            {filteredNotes.length === 0 && <div className="empty-list">{apiReady ? 'ノートがありません' : 'API接続後にノートを表示'}</div>}
+          <button className="side-action" onClick={() => openNewNote()}><FilePlus2 size={16} />新しいノート</button>
+          <div className="search-box">
+            <Search size={15} />
+            <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="名前でしぼりこむ" onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { setSwitcher(filter); setFilter('') } }} />
+            {filter && <button className="icon-button tiny" onClick={() => setFilter('')} aria-label="消す"><X size={14} /></button>}
           </div>
-          <div className="sidebar-bottom"><div className="section-label">タグ</div><div className="tag-placeholder"><Hash size={14}/>タグ管理は次の実装段階</div></div>
+          <div className="note-list">
+            {filter.trim()
+              ? <>
+                  {filtered.map((n) => <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''}`} onClick={() => openNote(n.path)} title={n.path}><span>{n.name}</span><small>{folderOf(n.path)}</small></button>)}
+                  <button className="note-item more" onClick={() => { setSwitcher(filter); setFilter('') }}><Search size={14} /><span>本文からも探す(Enter)</span></button>
+                </>
+              : <Tree node={tree} open={openFolders} toggle={toggleFolder} active={active} onOpen={(p) => void openNote(p)} />}
+            {apiOk === false && !notes.length && <div className="empty-list">サーバーにつながりません</div>}
+            {apiOk && !notes.length && <div className="empty-list">ノートがありません</div>}
+          </div>
+          <div className="sidebar-bottom">
+            <button className="section-toggle" onClick={() => { setTagsOpen((v) => !v); store('tags.open', tagsOpen ? '0' : '1') }}><Hash size={13} />タグ {tags.length ? `(${tags.length})` : ''}</button>
+            {tagsOpen && <div className="tag-cloud">
+              {tags.slice(0, 40).map((t) => <button key={t.tag} className="tag-chip" onClick={() => setSwitcher('#' + t.tag)}>#{t.tag}<small>{t.count}</small></button>)}
+              {!tags.length && <span className="empty-list">タグはまだありません</span>}
+            </div>}
+          </div>
         </aside>}
 
         <main className="main-area">
-          <div className="document-toolbar">
-            <div className="breadcrumbs"><span>Memo</span><span className="crumb-sep">/</span><strong>{title}</strong></div>
-            <div className="document-actions"><span className={`save-indicator ${saveState === '保存済み' ? 'saved' : ''}`}><i/>{saveLabel}</span><button className="icon-button" aria-label="その他"><MoreHorizontal size={18}/></button></div>
-          </div>
-
-          {notice && <div className="notice">{notice}<button onClick={() => setNotice('')}>閉じる</button></div>}
-          {conflict && <div className="conflict-banner"><strong>このノートは別の場所で更新されています。</strong><span>上書きせず、サーバー版を確認するか、自分の下書きを別名保存してください。</span><div><button onClick={saveConflictCopy}>自分の下書きを別名で保存</button><button onClick={() => { if (window.confirm('自分の下書きを捨てて、サーバー版を読み込みますか？')) loadServerVersion() }}>サーバー版を読み込む(下書きは捨てる)</button></div></div>}
-
-          <article className="document">
-            <div className="eyebrow">PERSONAL KNOWLEDGE BASE</div>
-            <h1 className="document-title">{title}</h1>
-            <div className="meta-row"><span>Markdown</span><span>·</span><span>{activePath || 'デモコンテンツ'}</span></div>
-            <div className="mode-switch" role="tablist" aria-label="表示">
-              <button className={presentation === 'obsidian' ? 'selected' : ''} onClick={() => togglePresentation('obsidian')}><PenLine size={14}/> Obsidian表示</button>
-              <button className={presentation === 'notion' ? 'selected' : ''} onClick={() => togglePresentation('notion')}><Sparkles size={14}/> Notion表示</button>
-              <button className={presentation === 'source' ? 'selected' : ''} onClick={() => togglePresentation('source')}><Command size={14}/> ソース</button>
+          {doc ? <>
+            <div className="document-toolbar">
+              <div className="breadcrumbs" title={active}>
+                {folderOf(active).split('/').filter(Boolean).map((f, k) => <span key={k} className="crumb">{f}<span className="crumb-sep">/</span></span>)}
+                <strong>{nameOf(active)}</strong>
+              </div>
+              <div className="document-actions">
+                {sync && <button className={`save-indicator s-${sync.status}`} title={sync.message || STATUS_LABEL[sync.status]} onClick={() => engine.saveNow(active)} aria-live="polite">
+                  {STATUS_ICON[sync.status]}<span>{STATUS_LABEL[sync.status]}</span>
+                </button>}
+                <div className="menu-anchor">
+                  <button className="icon-button" onClick={() => setNoteMenu((v) => !v)} aria-label="ノートのメニュー" aria-expanded={noteMenu}><MoreHorizontal size={18} /></button>
+                  {noteMenu && <Dropdown items={noteMenuItems} onClose={() => setNoteMenu(false)} />}
+                </div>
+              </div>
             </div>
-            <div className={`editor-wrap mode-${presentation}`} ref={wrapRef}>
-              <CodeMirror
-                ref={editorRef}
-                value={content}
-                minHeight="50vh"
-                extensions={extensions}
-                theme="light"
-                basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: presentation === 'source', autocompletion: false }}
-                onChange={handleEditorChange}
-                placeholder={presentation === 'notion' ? '書きはじめる…(改行すると見出し・リストなどを選べる)' : 'ここから書き始める…'}
-              />
-              {showCommands && <div className="command-menu" style={{ top: menuPos.top, left: menuPos.left }}>
-                <div className="command-heading">{menuKind === 'block' ? 'ブロックにする' : '挿入'} <span>↑↓で選択 · Enterで決定 · Escで閉じる</span></div>
-                {commands.map((cmd, i) => <button key={cmd.label} className={i === commandIndex ? 'selected' : ''} onMouseMove={() => setCommandIndex(i)} onMouseDown={e => e.preventDefault()} onClick={() => applyBlock(cmd.hint)}><span className="command-icon">{cmd.icon}</span><span>{cmd.label}</span><small>{cmd.hint ? cmd.hint.replaceAll('\n', ' ↵ ') : '記号なし'}</small></button>)}
-              </div>}
+
+            {statusMsg && <div className={`status-strip s-${sync!.status}`}>{statusMsg}</div>}
+            {notice && <div className="notice">{notice}<button onClick={() => setNotice('')} aria-label="閉じる"><X size={14} /></button></div>}
+            {sync?.status === 'conflict' && <div className="conflict-banner">
+              <strong>このノートは、ほかの場所(Obsidian・別の端末など)で更新されています。</strong>
+              <span>どちらの内容も消さずに置いてあります。どうするか選んでください。</span>
+              <div>
+                <button onClick={showDiff}>差分を見る</button>
+                <button onClick={copyMineThenUseServer}>自分の版を別名で保存して、サーバーの版にする</button>
+                <button onClick={keepMine}>自分の版で上書きする</button>
+              </div>
+            </div>}
+
+            <article className="document">
+              <h1 className="document-title">{nameOf(active)}</h1>
+              <div className="mode-switch" role="tablist" aria-label="表示">
+                <button className={presentation === 'obsidian' ? 'selected' : ''} onClick={() => choosePresentation('obsidian')}><PenLine size={14} /> Obsidian</button>
+                <button className={presentation === 'notion' ? 'selected' : ''} onClick={() => choosePresentation('notion')}><Sparkles size={14} /> Notion</button>
+                <button className={presentation === 'source' ? 'selected' : ''} onClick={() => choosePresentation('source')}><Command size={14} /> ソース</button>
+              </div>
+              <div className={`editor-wrap mode-${presentation} ${loading ? 'loading' : ''}`} ref={wrapRef}>
+                <CodeMirror
+                  key={doc.path + ':' + doc.seq}
+                  ref={editorRef}
+                  value={doc.content}
+                  minHeight="55vh"
+                  extensions={extensions}
+                  theme="light"
+                  basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: presentation === 'source', autocompletion: false, searchKeymap: true }}
+                  onChange={(v) => { contentRef.current = v; engine.edit(doc.path, v) }}
+                  placeholder={presentation === 'notion' ? '書きはじめる…(改行すると見出し・リストなどを選べる)' : 'ここから書きはじめる…  / で見出しやリスト、[[ でノートへのリンク'}
+                />
+                {showCommands && <div className="command-menu" style={{ top: menuPos.top, left: menuPos.left }}>
+                  <div className="command-heading">{menuKind === 'block' ? 'ブロックにする' : '挿入'} <span>↑↓ · Enter · Esc</span></div>
+                  {commands.map((cmd, i) => <button key={cmd.label} className={i === commandIndex ? 'selected' : ''} onMouseMove={() => setCommandIndex(i)} onMouseDown={(e) => e.preventDefault()} onClick={() => applyBlock(cmd.hint)}><span className="command-icon">{cmd.icon}</span><span>{cmd.label}</span><small>{cmd.hint ? cmd.hint.replaceAll('\n', ' ↵ ') : '記号なし'}</small></button>)}
+                </div>}
+              </div>
+            </article>
+          </> : <div className="welcome">
+            {notice && <div className="notice">{notice}<button onClick={() => setNotice('')} aria-label="閉じる"><X size={14} /></button></div>}
+            <h1>memo</h1>
+            <p>{loading ? '開いています…' : apiOk === false ? 'サーバーにつながりません。つながると一覧が出ます。' : '左の一覧からノートを選ぶか、探してください。'}</p>
+            <div className="welcome-actions">
+              <button className="btn primary" onClick={() => setSwitcher('')}><Search size={15} /> ノートを探す</button>
+              <button className="btn" onClick={() => openNewNote()}><FilePlus2 size={15} /> 新しいノート</button>
             </div>
-          </article>
+            {recent.length > 0 && <><h2>最近更新したノート</h2>
+              <div className="recent">{recent.map((n) => <button key={n.path} onClick={() => openNote(n.path)}><b>{n.name}</b><small>{n.path}</small></button>)}</div></>}
+          </div>}
         </main>
       </div>
 
-      {showSettings && <div className="settings-popover">
-        <div className="settings-title">表示設定</div>
-        <div className="settings-row"><div><strong>編集時の表示</strong><small>どれも書いたまま保存。見た目だけ変わる</small></div><select value={presentation} onChange={e => togglePresentation(e.target.value as Presentation)}><option value="obsidian">Obsidian表示</option><option value="notion">Notion表示</option><option value="source">ソース</option></select></div>
-        <div className="settings-row"><div><strong>自動保存</strong><small>入力停止後 550ms</small></div><span className="setting-value">ON</span></div>
-        <div className="settings-row"><div><strong>ローカル下書き</strong><small>IndexedDBに保持</small></div><span className="setting-value">ON</span></div>
+      {settings && <div className="settings-popover">
+        <div className="settings-head"><span className="settings-title">設定</span><button className="icon-button" onClick={() => setSettings(false)} aria-label="閉じる"><X size={16} /></button></div>
+        <div className="settings-row"><div><strong>表示</strong><small>どれも書いたまま保存。見た目だけ変わる</small></div><select value={presentation} onChange={(e) => choosePresentation(e.target.value as Presentation)}>{PRESENTATIONS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</select></div>
+        <div className="settings-row"><div><strong>Obsidian の保管庫名</strong><small>「Obsidian で開く」に使う</small></div><input value={vaultName} onChange={(e) => { setVaultName(e.target.value); store('obsidian.vault', e.target.value) }} /></div>
+        <div className="settings-row"><div><strong>送信待ち</strong><small>端末に残っていて、サーバーの確認がまだのもの</small></div><span className="setting-value">{pending}件 {pending > 0 && <button className="btn tiny" onClick={() => engine.saveNow()}>今すぐ送る</button>}</span></div>
+        <div className="settings-row"><div><strong>キー</strong><small>Ctrl+K 探す · Alt+N 新しいノート · Ctrl+S すぐ保存 · / 候補 · [[ リンク</small></div></div>
       </div>}
-      <footer className="bottom-status"><span><span className="status-dot"/> {saveLabel}</span><span>{activePath || 'デモ表示 · APIを接続するとNAS上のノートを開けます'}</span><span>UTF-8 · Markdown</span></footer>
+
+      <footer className="bottom-status">
+        <span>{sync ? <>{STATUS_ICON[sync.status]} {STATUS_LABEL[sync.status]}</> : ''}{pending > 0 && <em> · 送信待ち {pending}件</em>}</span>
+        <span>{active}</span>
+        <span>UTF-8 · Markdown</span>
+      </footer>
+
+      {switcher !== null && <QuickSwitcher notes={notes} initial={switcher} onClose={() => setSwitcher(null)} onOpen={(p) => { setSwitcher(null); void openNote(p) }} onCreate={(name) => openNewNote(name)} />}
+      {newNote && <NewNoteDialog folders={folders} defaultFolder={newNote.folder} defaultName={newNote.name} onClose={() => setNewNote(null)} onCreate={(f, n) => createNote(f, n)} />}
+      {diff && <DiffDialog mine={diff.mine} server={diff.server} onClose={() => setDiff(null)} />}
     </div>
   )
-}
-
-function FileIcon() {
-  return <span className="file-icon"><FileText size={15}/></span>
 }

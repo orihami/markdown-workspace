@@ -1,0 +1,205 @@
+// 保存係(仕様 6)。画面(React)から切り離して、ノートごとに次の流れを受けもつ:
+//   1. 入力のたびに送信待ち(IndexedDB)へ書く ← 入力は通信を待たない
+//   2. 入力が止まって 600ms で API へ送る(ベースの ETag と mutation_id 付き)
+//   3. サーバーが保存を確認したら送信待ちを消して「保存済み」。それまでは「保存済み」と出さない
+//   4. 届かなければ間隔をのばしながら送り直す。409(競合)は送り直さず、本人に選んでもらう
+import { api, ApiError, notePath } from './api'
+import { clearOutbox, dropOutbox, getOutbox, listOutbox, putOutbox } from './storage'
+import { uuid } from './uuid'
+
+export type SaveStatus = 'saved' | 'saving' | 'unsaved' | 'offline' | 'conflict' | 'error'
+export type Conflict = { serverContent: string | null; serverEtag: string }
+export type NoteSync = { status: SaveStatus; message?: string; conflict?: Conflict; savedAt?: number }
+
+export const STATUS_LABEL: Record<SaveStatus, string> = {
+  saved: '保存済み',
+  saving: '保存中',
+  unsaved: '未保存',
+  offline: 'オフライン',
+  conflict: '競合',
+  error: 'エラー',
+}
+
+const DEBOUNCE_MS = 600
+const RETRY_MIN = 1000
+const RETRY_MAX = 30000
+
+export class SaveEngine {
+  private base = new Map<string, string>() // ノート → 今の内容のもとにしたサーバーの ETag
+  private info = new Map<string, NoteSync>()
+  private timers = new Map<string, ReturnType<typeof setTimeout>>()
+  private inflight = new Set<string>()
+  private again = new Set<string>()
+  private writes = new Map<string, Promise<void>>() // IndexedDB への書き込みを順番に
+  private retryTimer: ReturnType<typeof setTimeout> | null = null
+  private retryDelay = RETRY_MIN
+  private listeners = new Set<() => void>()
+  version = 0
+
+  subscribe = (fn: () => void) => {
+    this.listeners.add(fn)
+    return () => { this.listeners.delete(fn) }
+  }
+  private emit() {
+    this.version++
+    for (const fn of this.listeners) fn()
+  }
+  private set(path: string, next: NoteSync) {
+    this.info.set(path, next)
+    this.emit()
+  }
+
+  get(path: string): NoteSync {
+    return this.info.get(path) ?? { status: 'saved' }
+  }
+
+  // 送信待ちの数(競合をのぞく)
+  pending() {
+    let n = 0
+    for (const v of this.info.values()) if (v.status !== 'saved') n++
+    return n
+  }
+
+  // 起動時: 前に送れなかった分を読みこんで送り直す
+  private started = false
+  async start() {
+    if (this.started) return
+    this.started = true
+    for (const ob of await listOutbox()) {
+      if (!this.base.has(ob.path)) this.base.set(ob.path, ob.baseEtag)
+      this.set(ob.path, { status: 'unsaved', message: '前回送れなかった変更があります' })
+    }
+    const kick = () => { this.retryDelay = RETRY_MIN; void this.retryAll() }
+    window.addEventListener('online', kick)
+    window.addEventListener('focus', kick)
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') kick() })
+    window.addEventListener('offline', () => {
+      for (const [p, v] of this.info) if (v.status === 'unsaved' || v.status === 'saving') this.set(p, { status: 'offline', message: '端末がオフラインです。入力は端末に残しています' })
+    })
+    void this.retryAll()
+  }
+
+  // ノートを開いたとき。送信待ちがあればそれを返す(サーバーより新しい自分の内容)
+  async open(path: string, serverContent: string, serverEtag: string): Promise<{ content: string; restored: boolean }> {
+    const ob = await getOutbox(path)
+    if (ob && ob.content !== serverContent) {
+      this.base.set(path, ob.baseEtag)
+      if (this.get(path).status !== 'conflict') this.set(path, { status: 'unsaved', message: '送れていない変更を復元しました' })
+      this.schedule(path, 0)
+      return { content: ob.content, restored: true }
+    }
+    if (ob) await dropOutbox(path) // 中身がサーバーと同じなら送る必要はない
+    this.base.set(path, serverEtag)
+    this.set(path, { status: 'saved' })
+    return { content: serverContent, restored: false }
+  }
+
+  // 入力のたび(画面からすぐ呼ばれる。通信は待たない)
+  edit(path: string, content: string) {
+    const baseEtag = this.base.get(path)
+    if (!baseEtag) return
+    const ob = { path, content, baseEtag, mutationId: uuid(), updatedAt: Date.now() }
+    const prev = this.writes.get(path) ?? Promise.resolve()
+    const done = prev.then(() => putOutbox(ob)).catch(() => {
+      this.set(path, { status: 'error', message: '端末に下書きを保存できません(ブラウザの保存領域を確認してください)' })
+    })
+    this.writes.set(path, done)
+    const cur = this.get(path)
+    if (cur.status !== 'conflict') this.set(path, { status: navigator.onLine ? 'unsaved' : 'offline', message: cur.status === 'offline' ? cur.message : undefined })
+    this.schedule(path, DEBOUNCE_MS)
+  }
+
+  // Ctrl+S: すぐ送る
+  saveNow(path?: string) {
+    if (path) this.schedule(path, 0)
+    else void this.retryAll()
+  }
+
+  private schedule(path: string, ms: number) {
+    clearTimeout(this.timers.get(path))
+    this.timers.set(path, setTimeout(() => { this.timers.delete(path); void this.flush(path) }, ms))
+  }
+
+  private async flush(path: string) {
+    if (this.get(path).status === 'conflict') return
+    if (this.inflight.has(path)) { this.again.add(path); return }
+    this.inflight.add(path)
+    try {
+      await this.writes.get(path)
+      const ob = await getOutbox(path)
+      if (!ob) return
+      this.set(path, { status: 'saving' })
+      try {
+        const res = await api<{ etag: string }>(notePath(path), {
+          method: 'PUT',
+          body: JSON.stringify({ content: ob.content, base_etag: ob.baseEtag, mutation_id: ob.mutationId }),
+        })
+        this.base.set(path, res.etag)
+        await clearOutbox(path, ob.mutationId)
+        // 送っている間にさらに書いた分は、いま保存できた版をもとにして続けて送る
+        const newer = await getOutbox(path)
+        if (newer) {
+          await putOutbox({ ...newer, baseEtag: res.etag })
+          this.again.add(path)
+          this.set(path, { status: 'unsaved' })
+        } else this.set(path, { status: 'saved', savedAt: Date.now() })
+        this.retryDelay = RETRY_MIN
+      } catch (e) {
+        const err = e instanceof ApiError ? e : new ApiError(String(e), 0)
+        if (err.status === 409) {
+          this.set(path, { status: 'conflict', conflict: { serverContent: err.body?.server_content ?? null, serverEtag: err.body?.server_etag }, message: 'ほかの場所でこのノートが更新されています' })
+        } else if (err.network) {
+          this.set(path, navigator.onLine ? { status: 'unsaved', message: 'サーバーにつながりません。つながりしだい送ります' } : { status: 'offline', message: '端末がオフラインです。入力は端末に残しています' })
+          this.scheduleRetry()
+        } else if (err.status === 503 || err.status >= 500) {
+          this.set(path, { status: 'unsaved', message: 'サーバーが保存できませんでした(HDD が外れているかもしれません)。送り直します' })
+          this.scheduleRetry()
+        } else {
+          this.set(path, { status: 'error', message: `保存できません: ${err.message}(内容は端末に残しています)` })
+        }
+      }
+    } finally {
+      this.inflight.delete(path)
+      if (this.again.delete(path)) this.schedule(path, 0)
+    }
+  }
+
+  private scheduleRetry() {
+    if (this.retryTimer) return
+    this.retryTimer = setTimeout(() => { this.retryTimer = null; void this.retryAll() }, this.retryDelay)
+    this.retryDelay = Math.min(this.retryDelay * 2, RETRY_MAX)
+  }
+
+  async retryAll() {
+    for (const ob of await listOutbox()) {
+      if (!this.base.has(ob.path)) this.base.set(ob.path, ob.baseEtag)
+      if (this.get(ob.path).status !== 'conflict') void this.flush(ob.path)
+    }
+  }
+
+  // 競合の解き方(どれも本人が選ぶ。勝手にどちらかを捨てない)
+  async useServer(path: string) {
+    const c = this.get(path).conflict
+    if (!c) return null
+    await dropOutbox(path)
+    this.base.set(path, c.serverEtag)
+    this.set(path, { status: 'saved' })
+    return c.serverContent
+  }
+
+  async keepMine(path: string) {
+    const c = this.get(path).conflict
+    const ob = await getOutbox(path)
+    if (!c || !ob) return
+    await putOutbox({ ...ob, baseEtag: c.serverEtag, mutationId: uuid() })
+    this.base.set(path, c.serverEtag)
+    this.set(path, { status: 'unsaved' })
+    this.schedule(path, 0)
+  }
+
+  async mineContent(path: string) {
+    return (await getOutbox(path))?.content ?? null
+  }
+}
+
+export const engine = new SaveEngine()

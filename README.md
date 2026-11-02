@@ -14,7 +14,8 @@ NAS上のMarkdownを唯一の正本として扱う、個人用ブラウザMarkdo
 サーバーは **ko-pi**（以前の仕様書でいう「常時稼働WindowsミニPC」と同じマシン。今は Debian）で動かしている。HDD が ko-pi に直接つながっているので、NAS 越しの遅さがない。
 
 - systemd の `markdown-workspace.service` で常時起動。設定（Vault の場所・待ち受け先など）は `/etc/markdown-workspace/env`（リポジトリには入れない）
-- Tailscale のアドレスだけで待ち受けるので、Tailscale につながった PC・スマホから `http://ko-pi:<ポート>/` で開く。インターネットには出していない
+- アプリは ko-pi の中だけで待ち受け、`tailscale serve` の https（Tailscale 内だけ。Funnel なし）から入る。Tailscale につながった PC・スマホから `https://ko-pi.<tailnet>.ts.net:<ポート>/` で開く。インターネットには出していない
+- **https で開く必要がある**（http だと `crypto.randomUUID`・Service Worker・クリップボードが使えない。2026-11-02 に http で保存が1回も送られなかった）
 - 画面（frontend をビルドした `frontend/dist`）も API と同じポートで配る
 - **今は OMNI のコピー（SSD 上）を相手にしている**。本物の Vault に切り替えるのは、ユーザーが試して問題ないと確認してから
 
@@ -24,7 +25,7 @@ NAS上のMarkdownを唯一の正本として扱う、個人用ブラウザMarkdo
 cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest httpx
 .venv/bin/python -m pytest -q tests          # パスの安全・競合・原子的保存・改行コード・権限
 cd ../frontend && npm ci && npm run build      # 画面をビルド(サービスはこの dist を配る)
-npm run e2e                                    # ブラウザで 入力→保存・API停止→再送・競合・CRLF を通しで確認
+npm run e2e                                    # ブラウザで通し(http と同じ条件の保存・表示・リンク・検索・停止→再送・競合・CRLF など38項目)
 sudo systemctl restart markdown-workspace      # 変更を反映
 ```
 

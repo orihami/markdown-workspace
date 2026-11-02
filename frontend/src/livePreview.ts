@@ -3,11 +3,14 @@
 //
 //   obsidian: カーソルのある行だけ記号(# - ** > など)が見える。ほかの行は整った見た目
 //   notion  : 記号はいつも隠す
+//   source  : 記号はそのまま。リンクだけ Ctrl(⌘)+クリックで開けるようにする
+// リンクを押すと onLink が呼ばれる(URL は新しいタブ、[[内部リンク]] はそのノートを開く)
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, WidgetType } from '@codemirror/view'
 import { Range, Text } from '@codemirror/state'
 import { syntaxTree } from '@codemirror/language'
 
-export type LiveMode = 'obsidian' | 'notion'
+export type LiveMode = 'obsidian' | 'notion' | 'source'
+export type LinkHandler = (kind: 'url' | 'note', target: string) => void
 
 class BulletWidget extends WidgetType {
   eq() { return true }
@@ -53,10 +56,14 @@ export function frontmatterEnd(doc: Text): number {
   return 0
 }
 
-function build(view: EditorView, mode: LiveMode): DecorationSet {
+const linkMark = (cls: string, attrs: Record<string, string>) => Decoration.mark({ class: cls, attributes: attrs })
+
+function build(view: EditorView, mode: LiveMode): { all: DecorationSet; atomic: DecorationSet } {
+  const source = mode === 'source'
   const { state } = view
   const doc = state.doc
   const decos: Range<Decoration>[] = []
+  const atomic: Range<Decoration>[] = [] // 隠した記号・置きかえた部品(カーソルはまとめて飛ばす)
   const fmEnd = frontmatterEnd(doc)
   // obsidian: カーソル(選択)のある行は原文を見せる
   const active = new Set<number>()
@@ -67,14 +74,16 @@ function build(view: EditorView, mode: LiveMode): DecorationSet {
   }
   const isActive = (pos: number) => active.has(doc.lineAt(pos).number)
   const hide = (from: number, to: number) => {
-    if (from < to && !isActive(from)) decos.push(hidden.range(from, to))
+    if (!source && from < to && !isActive(from)) atomic.push(hidden.range(from, to))
   }
   const eachLine = (from: number, to: number, cls: string) => {
+    if (source) return
     for (let n = doc.lineAt(from).number; n <= doc.lineAt(to).number; n++) decos.push(lineClass(cls).range(doc.line(n).from))
   }
   const codeLines = new Set<number>()
 
   if (fmEnd) eachLine(0, fmEnd, 'cm-lp-fm')
+  const look = (d: Range<Decoration>) => { if (!source) decos.push(d) }
 
   for (const { from, to } of view.visibleRanges) {
     syntaxTree(state).iterate({
@@ -98,13 +107,13 @@ function build(view: EditorView, mode: LiveMode): DecorationSet {
         } else if (name === 'EmphasisMark' || name === 'StrikethroughMark') {
           hide(node.from, node.to)
         } else if (name === 'StrongEmphasis') {
-          decos.push(markClass('cm-lp-strong').range(node.from, node.to))
+          look(markClass('cm-lp-strong').range(node.from, node.to))
         } else if (name === 'Emphasis') {
-          decos.push(markClass('cm-lp-em').range(node.from, node.to))
+          look(markClass('cm-lp-em').range(node.from, node.to))
         } else if (name === 'Strikethrough') {
-          decos.push(markClass('cm-lp-strike').range(node.from, node.to))
+          look(markClass('cm-lp-strike').range(node.from, node.to))
         } else if (name === 'InlineCode') {
-          decos.push(markClass('cm-lp-icode').range(node.from, node.to))
+          look(markClass('cm-lp-icode').range(node.from, node.to))
         } else if (name === 'CodeMark' && node.node.parent?.name === 'InlineCode') {
           hide(node.from, node.to)
         } else if (name === 'FencedCode' || name === 'CodeBlock') {
@@ -113,7 +122,7 @@ function build(view: EditorView, mode: LiveMode): DecorationSet {
           for (let n = first; n <= last; n++) {
             codeLines.add(n)
             const fence = name === 'FencedCode' && (n === first || n === last)
-            decos.push(lineClass('cm-lp-code' + (fence ? ' cm-lp-fence' : '') + (n === first ? ' cm-lp-code-first' : '') + (n === last ? ' cm-lp-code-last' : '')).range(doc.line(n).from))
+            look(lineClass('cm-lp-code' + (fence ? ' cm-lp-fence' : '') + (n === first ? ' cm-lp-code-first' : '') + (n === last ? ' cm-lp-code-last' : '')).range(doc.line(n).from))
           }
           return false
         } else if (name === 'Blockquote') {
@@ -125,29 +134,31 @@ function build(view: EditorView, mode: LiveMode): DecorationSet {
           const item = node.node.parent
           const list = item?.parent?.name
           const hasTask = !!item?.getChild('Task')
+          if (source) return
           if (list === 'BulletList' && !isActive(node.from)) {
             if (hasTask) hide(node.from, node.to + 1)
-            else decos.push(bullet.range(node.from, node.to))
-          } else if (list === 'OrderedList') decos.push(markClass('cm-lp-olmark').range(node.from, node.to))
+            else atomic.push(bullet.range(node.from, node.to))
+          } else if (list === 'OrderedList') look(markClass('cm-lp-olmark').range(node.from, node.to))
         } else if (name === 'TaskMarker') {
-          if (!isActive(node.from)) {
+          if (!source && !isActive(node.from)) {
             const checked = /x/i.test(doc.sliceString(node.from, node.to))
-            decos.push(Decoration.replace({ widget: new CheckWidget(checked, node.from) }).range(node.from, node.to))
+            atomic.push(Decoration.replace({ widget: new CheckWidget(checked, node.from) }).range(node.from, node.to))
           }
         } else if (name === 'Link') {
-          decos.push(markClass('cm-lp-link').range(node.from, node.to))
-          // [文字](URL) → 文字だけ見せる
-          const hasUrl = !!node.node.getChild('URL')
-          if (hasUrl) {
+          // [文字](URL) → 文字だけ見せる。押すと URL を開く
+          const url = node.node.getChild('URL')
+          if (url) decos.push(linkMark('cm-lp-link', { 'data-href': doc.sliceString(url.from, url.to) }).range(node.from, node.to))
+          if (url) {
             for (let c = node.node.firstChild; c; c = c.nextSibling) {
               if (c.name === 'LinkMark' || c.name === 'URL' || c.name === 'LinkTitle') hide(c.from, c.to)
             }
           }
           return false
         } else if (name === 'URL' && node.node.parent?.name !== 'Link') {
-          decos.push(markClass('cm-lp-link').range(node.from, node.to))
+          // <https://…> や、そのまま書いた https://…
+          decos.push(linkMark('cm-lp-link', { 'data-href': doc.sliceString(node.from, node.to) }).range(node.from, node.to))
         } else if (name === 'HorizontalRule') {
-          decos.push(lineClass('cm-lp-hr').range(doc.lineAt(node.from).from))
+          look(lineClass('cm-lp-hr').range(doc.lineAt(node.from).from))
           hide(node.from, node.to)
         }
       },
@@ -161,36 +172,60 @@ function build(view: EditorView, mode: LiveMode): DecorationSet {
         for (const mm of text.matchAll(/\[\[([^\]\n]+)\]\]/g)) {
           const s = line.from + mm.index!
           const e = s + mm[0].length
-          decos.push(markClass('cm-lp-wikilink').range(s + 2, e - 2))
+          // [[ノート#見出し|表示名]] → 表示名(なければノート名)だけ見せる
+          const inner = mm[1]
+          const bar = inner.indexOf('|')
+          const target = (bar >= 0 ? inner.slice(0, bar) : inner).split('#')[0].trim()
+          decos.push(linkMark('cm-lp-wikilink', { 'data-note': target }).range(s + 2, e - 2))
           hide(s, s + 2)
+          if (bar >= 0) hide(s + 2, s + 3 + bar)
           hide(e - 2, e)
         }
         for (const mm of text.matchAll(/(^|\s)(#[^\s#[\]().,!?;:'"`]+)/g)) {
           const s = line.from + mm.index! + mm[1].length
-          decos.push(markClass('cm-lp-tag').range(s, s + mm[2].length))
+          look(markClass('cm-lp-tag').range(s, s + mm[2].length))
         }
       }
       pos = line.to + 1
     }
   }
-  return Decoration.set(decos, true)
+  return { all: Decoration.set([...decos, ...atomic], true), atomic: Decoration.set(atomic, true) }
 }
 
-export function livePreview(mode: LiveMode) {
+export function livePreview(mode: LiveMode, onLink: LinkHandler) {
   const plugin = ViewPlugin.fromClass(
     class {
       decorations: DecorationSet
+      atomic: DecorationSet
       constructor(view: EditorView) {
-        this.decorations = build(view, mode)
+        ;({ all: this.decorations, atomic: this.atomic } = build(view, mode))
       }
       update(u: ViewUpdate) {
         if (u.docChanged || u.viewportChanged || u.selectionSet || syntaxTree(u.state) !== syntaxTree(u.startState)) {
-          this.decorations = build(u.view, mode)
+          ;({ all: this.decorations, atomic: this.atomic } = build(u.view, mode))
         }
       }
     },
     { decorations: (v) => v.decorations },
   )
+  // リンクを押したとき。Obsidian表示ではカーソルのある行(記号が見えて編集中の行)は開かずに編集させる
+  const clicks = EditorView.domEventHandlers({
+    mousedown(e, view) {
+      const el = (e.target as HTMLElement).closest('[data-href],[data-note]') as HTMLElement | null
+      if (!el || e.button !== 0) return false
+      const modifier = e.ctrlKey || e.metaKey
+      if (mode === 'source' && !modifier) return false
+      if (mode === 'obsidian' && !modifier) {
+        const pos = view.posAtDOM(el)
+        const line = view.state.doc.lineAt(pos).number
+        if (view.state.selection.ranges.some((r) => view.state.doc.lineAt(r.head).number === line)) return false
+      }
+      e.preventDefault()
+      if (el.dataset.href) onLink('url', el.dataset.href)
+      else if (el.dataset.note) onLink('note', el.dataset.note)
+      return true
+    },
+  })
   // 隠した記号はカーソルで1文字ずつ通らない(まとめて飛ばす)
-  return [plugin, EditorView.atomicRanges.of((view) => view.plugin(plugin)?.decorations ?? Decoration.none)]
+  return [plugin, clicks, EditorView.atomicRanges.of((view) => view.plugin(plugin)?.atomic ?? Decoration.none)]
 }

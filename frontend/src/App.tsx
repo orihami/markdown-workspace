@@ -3,13 +3,13 @@ import CodeMirror, { ReactCodeMirrorRef } from '@uiw/react-codemirror'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorView, keymap } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
-import { AlertTriangle, BookOpen, Check, CircleDot, CloudOff, Command, FilePlus2, Folder, Hash, Loader2, Menu, MoreHorizontal, PenLine, Search, Settings2, Sparkles, Trash2, Wifi, WifiOff, X } from 'lucide-react'
+import { AlertTriangle, Check, ChevronRight, CircleDot, CloudOff, FilePlus2, Hash, ListChecks, Loader2, Menu, MoreHorizontal, Plus, Search, Settings2, Star, Trash2, Wifi, WifiOff, X } from 'lucide-react'
 import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode } from './livePreview'
 import { workspaceCompletions } from './completions'
-import { buildTree, DeleteDialog, DiffDialog, Dropdown, folderList, MenuItem, NewNoteDialog, PropsPanel, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree } from './components'
-import { inMemoFolder, MEMO_FOLDER, newNoteContent, parseFront, SortName, sortNotes, SORTS } from './memo'
+import { buildTree, DeleteDialog, DiffDialog, Dropdown, folderList, MenuItem, NewNoteDialog, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree } from './components'
+import { inMemoFolder, makeTask, MEMO_FOLDER, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
 
 // 表示(仕様 4.3)。どれも同じエディタで直接書き、ファイルの中身は変えない(見た目だけ)
 //   obsidian: ライブプレビュー(カーソルの行だけ記号が見える) / notion: 記号を隠し、改行で候補 / source: 記号をそのまま
@@ -63,10 +63,7 @@ export default function App() {
     return PRESENTATIONS.some((p) => p.id === saved) ? saved : 'obsidian'
   })
   const [sidebarOpen, setSidebarOpen] = useState(() => !isMobile())
-  const [filter, setFilter] = useState('')
   const [openFolders, setOpenFolders] = useState<Set<string>>(() => { try { return new Set(JSON.parse(load('tree.open', '[]'))) } catch { return new Set() } })
-  // 左の一覧は「フォルダ」と「タグ」を切りかえて、どちらかを広く出す(タグがフォルダを押しつぶさないように)
-  const [sideTab, setSideTab] = useState<'files' | 'tags'>(() => (load('side.tab', 'files') === 'tags' ? 'tags' : 'files'))
   const [switcher, setSwitcher] = useState<string | null>(null)
   const [newNote, setNewNote] = useState<{ folder: string; name: string } | null>(null)
   const [noteMenu, setNoteMenu] = useState(false)
@@ -84,7 +81,11 @@ export default function App() {
   const [delLinks, setDelLinks] = useState<number | null>(null)
   const [trashOpen, setTrashOpen] = useState(false)
   const [toast, setToast] = useState<{ text: string; action?: string; onAction?: () => void } | null>(null)
-  const [ctx, setCtx] = useState<{ path: string; x: number; y: number } | null>(null)
+  const [ctx, setCtx] = useState<{ path: string; x: number; y: number; folder?: boolean } | null>(null)
+  // お気に入り(サーバーに覚えさせ、どの端末でも同じ)
+  const [favs, setFavs] = useState<{ path: string; kind: 'note' | 'folder' }[]>([])
+  // 左の一覧の引き出し(ほかのフォルダ・タグはふだん閉じておく。基本は めも)
+  const [secOpen, setSecOpen] = useState<Record<string, boolean>>(() => { try { return JSON.parse(load('side.sections', '{}')) } catch { return {} } })
 
   const editorRef = useRef<ReactCodeMirrorRef>(null)
   const notesRef = useRef(notes)
@@ -137,6 +138,9 @@ export default function App() {
       setApiOk(false)
     }
   }, [])
+  const loadFavs = useCallback(async () => {
+    try { setFavs((await api<{ items: { path: string; kind: 'note' | 'folder' }[] }>('/api/favorites')).items) } catch { /* あとで */ }
+  }, [])
   const loadTags = useCallback(async () => {
     try { setTags((await api<{ items: TagCount[] }>('/api/tags')).items) } catch { /* あとで */ }
   }, [])
@@ -188,6 +192,7 @@ export default function App() {
     void engine.start()
     void loadTree()
     void loadTags()
+    void loadFavs()
     const first = hashPath() || load('last.note', '')
     if (first) void openNote(first, { push: !hashPath() })
     const onHash = () => { const p = hashPath(); if (p && p !== activeRef.current) void openNote(p, { push: false }) }
@@ -206,7 +211,7 @@ export default function App() {
       window.removeEventListener('offline', down)
       clearInterval(health)
     }
-  }, [loadTree, loadTags, openNote])
+  }, [loadTree, loadTags, loadFavs, openNote])
 
   // ---- 新しいノート ----
   // 新しいメモは ふだん「めも」に作る(Obsidian の設定と同じ)
@@ -364,6 +369,8 @@ export default function App() {
       // Ctrl+N はブラウザが新しいウィンドウに使うことがあるので Alt+N でも
       else if ((mod || e.altKey) && k === 'n') { e.preventDefault(); openNewNote() }
       else if (mod && k === 's') { e.preventDefault(); engine.saveNow(activeRef.current || undefined) }
+      // Ctrl+E: Obsidian と同じく、見た目(Obsidian表示)とソースを切りかえる
+      else if (mod && k === 'e') { e.preventDefault(); setPresentation((p) => { const next = p === 'source' ? 'obsidian' : 'source'; store('editor.presentation', next); return next }) }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
@@ -409,8 +416,19 @@ export default function App() {
     'sep',
     { label: '整理待ちへ移す(消す)…', danger: true, onClick: () => askDelete(active) },
     'sep',
-    ...PRESENTATIONS.map((p) => ({ label: `${presentation === p.id ? '✓ ' : '　'}${p.label}`, onClick: () => choosePresentation(p.id) })),
+    ...PRESENTATIONS.map((p) => ({ label: `${presentation === p.id ? '✓ ' : '　'}${p.label}${p.id === 'source' ? '(Ctrl+E)' : ''}`, onClick: () => choosePresentation(p.id) })),
   ] : []
+
+  const isFav = (path: string) => favs.some((f) => f.path === path)
+  const toggleFav = async (path: string, kind: 'note' | 'folder') => {
+    try {
+      const r = isFav(path)
+        ? await api<{ items: typeof favs }>(`/api/favorites?path=${encodeURIComponent(path)}`, { method: 'DELETE' })
+        : await api<{ items: typeof favs }>('/api/favorites', { method: 'POST', body: JSON.stringify({ path, kind }) })
+      setFavs(r.items)
+    } catch (e) { setToast({ text: `お気に入りを変えられませんでした: ${(e as Error).message}` }) }
+  }
+  const toggleSec = (key: string) => setSecOpen((prev) => { const next = { ...prev, [key]: !prev[key] }; store('side.sections', JSON.stringify(next)); return next })
 
   // プロパティの欄からの変更も、ふつうの入力と同じくエディタに書く(元に戻す・保存が同じ流れになる)
   const editHead = (changes: TextChange[]) => {
@@ -474,87 +492,108 @@ export default function App() {
     store('tree.open', JSON.stringify([...next]))
     return next
   })
-  const filtered = useMemo(() => {
-    const s = filter.trim().toLowerCase()
-    return s ? notes.filter((n) => n.path.toLowerCase().includes(s)).slice(0, 200) : []
-  }, [filter, notes])
   const pending = engine.pending()
   const connected = online && apiOk !== false
   const recent = useMemo(() => sortNotes(notes.filter((n) => n.date), '日付が新しい順').slice(0, 8), [notes])
   const statusMsg = sync && sync.message && sync.status !== 'saved' && sync.status !== 'conflict' ? sync.message : ''
 
+  // 左の一覧: お気に入り → めも → (閉じた引き出し)ほかのフォルダ・タグ
+  const memoNode = tree.folders.find((f) => f.path === MEMO_FOLDER)
+  const othersNode = { ...tree, folders: tree.folders.filter((f) => f.path !== MEMO_FOLDER) }
+  const findFolder = (path: string) => {
+    let node: typeof tree | undefined = tree
+    for (const part of path.split('/')) node = node?.folders.find((f) => f.name === part)
+    return node
+  }
+  const treeProps = {
+    open: openFolders,
+    toggle: toggleFolder,
+    active,
+    onOpen: (p: string) => void openNote(p),
+    onContext: (path: string, x: number, y: number) => setCtx({ path, x, y }),
+    onFolderContext: (path: string, x: number, y: number) => setCtx({ path, x, y, folder: true }),
+    sort,
+  }
+  const isTask = !!(propValue(head, '遂行日') || propValue(head, '完了'))
+  const done = /^true$/i.test(propValue(head, '完了')?.value || '')
+  const taskDay = propValue(head, '遂行日')?.value || ''
+
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="brand">
-          <button className="icon-button" onClick={() => setSidebarOpen((v) => !v)} aria-label="一覧を開く・閉じる"><Menu size={19} /></button>
-          <div className="brand-mark"><BookOpen size={17} /></div><span>memo</span>
-        </div>
-        <button className="top-search" onClick={() => { void loadTree(); setSwitcher('') }}><Search size={15} /><span>ノートを探す</span><kbd>Ctrl K</kbd></button>
-        <div className="top-actions">
-          <span className={`connection ${connected ? 'ok' : 'down'}`} title={connected ? 'サーバーにつながっています' : 'サーバーにつながっていません。書いた分は端末に残し、つながりしだい送ります'}>
-            {connected ? <Wifi size={14} /> : <WifiOff size={14} />}<span>{!online ? 'オフライン' : apiOk === false ? 'サーバー停止中' : '接続中'}</span>
-          </span>
-          <button className="icon-button" onClick={() => setSettings((v) => !v)} aria-label="設定"><Settings2 size={18} /></button>
-        </div>
-      </header>
-
       <div className="workspace">
         {sidebarOpen && isMobile() && <div className="drawer-backdrop" onClick={() => setSidebarOpen(false)} />}
         {sidebarOpen && <aside className="sidebar">
-          <button className="side-action" onClick={() => openNewNote()}><FilePlus2 size={16} />新しいメモ・タスク</button>
-          <div className="search-box">
-            <Search size={15} />
-            <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={sideTab === 'tags' ? 'タグをしぼりこむ' : '名前でしぼりこむ'} onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && sideTab === 'files') { setSwitcher(filter); setFilter('') } }} />
-            {filter && <button className="icon-button tiny" onClick={() => setFilter('')} aria-label="消す"><X size={14} /></button>}
+          <div className="side-top">
+            <button className="side-search" onClick={() => { void loadTree(); setSwitcher('') }}><Search size={15} /><span>探す</span><kbd>Ctrl K</kbd></button>
+            <button className="side-new" onClick={() => openNewNote()} aria-label="新しいメモ・タスク" title="新しいメモ・タスク(Alt+N)"><Plus size={18} /></button>
           </div>
-          <div className="seg side-tabs" role="tablist">
-            <button className={sideTab === 'files' ? 'on' : ''} onClick={() => { setSideTab('files'); store('side.tab', 'files') }} role="tab" aria-selected={sideTab === 'files'}><Folder size={14} /> フォルダ</button>
-            <button className={sideTab === 'tags' ? 'on' : ''} onClick={() => { setSideTab('tags'); store('side.tab', 'tags') }} role="tab" aria-selected={sideTab === 'tags'}><Hash size={14} /> タグ{tags.length ? ` ${tags.length}` : ''}</button>
-          </div>
-          {sideTab === 'tags' ? <div className="tag-list">
-            {tags.filter((t) => !filter.trim() || t.tag.toLowerCase().includes(filter.trim().toLowerCase())).map((t) => (
-              <button key={t.tag} className="tag-row" onClick={() => setSwitcher('#' + t.tag)}><span>#{t.tag}</span><small>{t.count}</small></button>
-            ))}
-            {!tags.length && <span className="empty-list">タグはまだありません</span>}
-          </div> : <>
-          <label className="sort-box">並べ替え
-            <select value={sort} onChange={(e) => { setSort(e.target.value as SortName); store('tree.sort', e.target.value) }}>
-              {SORTS.map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
-          </label>
-          <div className="note-list">
-            {filter.trim()
-              ? <>
-                  {sortNotes(filtered, sort).map((n) => <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''}`} onClick={() => openNote(n.path)} title={n.path}><span>{n.name}</span><small>{folderOf(n.path)}</small></button>)}
-                  <button className="note-item more" onClick={() => { setSwitcher(filter); setFilter('') }}><Search size={14} /><span>本文からも探す(Enter)</span></button>
-                </>
-              : <Tree node={tree} open={openFolders} toggle={toggleFolder} active={active} onOpen={(p) => void openNote(p)} onContext={(path, x, y) => setCtx({ path, x, y })} sort={sort} />}
+          <div className="side-scroll">
+            {favs.length > 0 && <section className="side-sec">
+              <div className="side-head"><Star size={12} /> お気に入り</div>
+              {favs.map((f) => {
+                if (f.kind === 'note') {
+                  const n = notes.find((x) => x.path === f.path)
+                  if (!n) return null
+                  return <button key={f.path} className={`note-item ${active === n.path ? 'active' : ''}`} onClick={() => void openNote(n.path)} onContextMenu={(e) => { e.preventDefault(); setCtx({ path: n.path, x: e.clientX, y: e.clientY }) }} title={n.path}><Star size={14} className="file-icon" /><span>{n.name}</span></button>
+                }
+                const node = findFolder(f.path)
+                if (!node) return null
+                const key = 'fav:' + f.path
+                return <div key={f.path}>
+                  <button className="tree-folder" onClick={() => toggleFolder(key)} onContextMenu={(e) => { e.preventDefault(); setCtx({ path: f.path, x: e.clientX, y: e.clientY, folder: true }) }} aria-expanded={openFolders.has(key)}>
+                    <ChevronRight size={14} className={`chev ${openFolders.has(key) ? 'open' : ''}`} /><span>{node.name}</span>
+                  </button>
+                  {openFolders.has(key) && <Tree node={node} {...treeProps} depth={1} />}
+                </div>
+              })}
+            </section>}
+            {memoNode ? <section className="side-sec">
+              <div className="side-head">
+                <span>めも</span><small>{notes.filter((n) => inMemoFolder(n.path)).length}</small>
+                <select className="sort-mini" value={sort} onChange={(e) => { setSort(e.target.value as SortName); store('tree.sort', e.target.value) }} aria-label="並べ替え">
+                  {SORTS.map((x) => <option key={x} value={x}>{x}</option>)}
+                </select>
+              </div>
+              <Tree node={memoNode} {...treeProps} />
+            </section> : <section className="side-sec"><Tree node={tree} {...treeProps} /></section>}
+            {memoNode && <section className="side-sec">
+              <button className="side-head toggle" onClick={() => toggleSec('others')} aria-expanded={!!secOpen.others}><ChevronRight size={13} className={`chev ${secOpen.others ? 'open' : ''}`} /> ほかのフォルダ</button>
+              {secOpen.others && <Tree node={othersNode} {...treeProps} />}
+            </section>}
+            <section className="side-sec">
+              <button className="side-head toggle" onClick={() => toggleSec('tags')} aria-expanded={!!secOpen.tags}><ChevronRight size={13} className={`chev ${secOpen.tags ? 'open' : ''}`} /> タグ<small>{tags.length || ''}</small></button>
+              {secOpen.tags && <div className="tag-list">
+                {tags.map((t) => <button key={t.tag} className="tag-row" onClick={() => setSwitcher('#' + t.tag)}><span>#{t.tag}</span><small>{t.count}</small></button>)}
+                {!tags.length && <span className="empty-list">タグはまだありません</span>}
+              </div>}
+            </section>
             {apiOk === false && !notes.length && <div className="empty-list">サーバーにつながりません</div>}
-            {apiOk && !notes.length && <div className="empty-list">ノートがありません</div>}
           </div>
-          </>}
-          <button className="trash-link" onClick={() => setTrashOpen(true)}><Trash2 size={14} /> 整理待ち(消したノート)</button>
+          <div className="side-foot">
+            <button onClick={() => setTrashOpen(true)} title="整理待ち(消したノート)"><Trash2 size={14} /> 整理待ち</button>
+            <span className={`conn ${connected ? 'ok' : 'down'}`} title={connected ? 'サーバーにつながっています' : 'サーバーにつながっていません。書いた分は端末に残し、つながりしだい送ります'}>{connected ? <Wifi size={13} /> : <WifiOff size={13} />}{!online ? 'オフライン' : apiOk === false ? '停止中' : ''}</span>
+            <button onClick={() => setSettings((v) => !v)} aria-label="設定"><Settings2 size={15} /></button>
+          </div>
         </aside>}
 
         <main className="main-area">
-          {doc ? <>
-            <div className="document-toolbar">
-              <div className="breadcrumbs" title={active}>
-                {folderOf(active).split('/').filter(Boolean).map((f, k) => <span key={k} className="crumb">{f}<span className="crumb-sep">/</span></span>)}
-                <strong>{nameOf(active)}</strong>
-              </div>
-              <div className="document-actions">
-                {sync && <button className={`save-indicator s-${sync.status}`} title={sync.message || STATUS_LABEL[sync.status]} onClick={() => engine.saveNow(active)} aria-live="polite">
-                  {STATUS_ICON[sync.status]}<span>{STATUS_LABEL[sync.status]}</span>
-                </button>}
-                <div className="menu-anchor">
-                  <button className="icon-button" onClick={() => setNoteMenu((v) => !v)} aria-label="ノートのメニュー" aria-expanded={noteMenu}><MoreHorizontal size={18} /></button>
-                  {noteMenu && <Dropdown items={noteMenuItems} onClose={() => setNoteMenu(false)} />}
-                </div>
-              </div>
+          <div className="topline">
+            <button className="tool icon" onClick={() => setSidebarOpen((v) => !v)} aria-label="一覧を開く・閉じる"><Menu size={18} /></button>
+            {doc && <div className="breadcrumbs" title={active}>{folderOf(active).split('/').filter(Boolean).join(' / ')}</div>}
+            <div className="top-tools">
+              {doc && !isTask && <button className="tool" onClick={() => editHead(makeTask(contentRef.current))} title="遂行日・完了 を付けてタスクにする"><ListChecks size={15} /> タスクにする</button>}
+              {sync && <button className={`save-indicator s-${sync.status}`} title={sync.message || STATUS_LABEL[sync.status]} onClick={() => engine.saveNow(active)} aria-live="polite">
+                {STATUS_ICON[sync.status]}<span>{STATUS_LABEL[sync.status]}</span>{pending > 1 && <em>+{pending - 1}</em>}
+              </button>}
+              {doc && <button className={`tool icon ${isFav(active) ? 'on' : ''}`} onClick={() => void toggleFav(active, 'note')} aria-label={isFav(active) ? 'お気に入りから外す' : 'お気に入りにする'} title={isFav(active) ? 'お気に入りから外す' : 'お気に入りにする'}><Star size={17} /></button>}
+              {doc && <div className="menu-anchor">
+                <button className="tool icon" onClick={() => setNoteMenu((v) => !v)} aria-label="ノートのメニュー" aria-expanded={noteMenu}><MoreHorizontal size={18} /></button>
+                {noteMenu && <Dropdown items={noteMenuItems} onClose={() => setNoteMenu(false)} />}
+              </div>}
             </div>
+          </div>
 
+          {doc ? <>
             {statusMsg && <div className={`status-strip s-${sync!.status}`}>{statusMsg}</div>}
             {notice && <div className="notice">{notice}<button onClick={() => setNotice('')} aria-label="閉じる"><X size={14} /></button></div>}
             {sync?.status === 'conflict' && <div className="conflict-banner">
@@ -568,13 +607,16 @@ export default function App() {
             </div>}
 
             <article className="document">
-              <h1 className="document-title">{nameOf(active)}</h1>
-              <div className="mode-switch" role="tablist" aria-label="表示">
-                <button className={presentation === 'obsidian' ? 'selected' : ''} onClick={() => choosePresentation('obsidian')}><PenLine size={14} /> Obsidian</button>
-                <button className={presentation === 'notion' ? 'selected' : ''} onClick={() => choosePresentation('notion')}><Sparkles size={14} /> Notion</button>
-                <button className={presentation === 'source' ? 'selected' : ''} onClick={() => choosePresentation('source')}><Command size={14} /> ソース</button>
+              <div className="title-row">
+                {isTask && <input type="checkbox" className="title-check" checked={done} onChange={(e) => editHead(setProp(contentRef.current, '完了', e.target.checked ? 'true' : 'false'))} aria-label="完了" />}
+                <h1 className={`document-title ${done ? 'done' : ''}`}>{nameOf(active)}</h1>
               </div>
-              <PropsPanel
+              {isTask && <div className="task-line">
+                <label>遂行日<input type="date" value={/^\d{4}-\d{2}-\d{2}/.test(taskDay) ? taskDay.slice(0, 10) : ''} onChange={(e) => e.target.value && editHead(setProp(contentRef.current, '遂行日', e.target.value))} aria-label="遂行日" /></label>
+                {!done && taskDay && taskDay < today() && <span className="late">期限を過ぎています</span>}
+                {!done && taskDay === today() && <span className="today">今日</span>}
+              </div>}
+              <NoteMeta
                 text={head}
                 memo={inMemoFolder(active)}
                 fileDate={(() => { const m = notes.find((n) => n.path === active)?.modified_at; return m ? new Date(m).toLocaleDateString('sv-SE') : '' })()}
@@ -585,12 +627,12 @@ export default function App() {
                   key={doc.path + ':' + doc.seq}
                   ref={editorRef}
                   value={doc.content}
-                  minHeight="55vh"
+                  minHeight="60vh"
                   extensions={extensions}
                   theme="light"
                   basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: presentation === 'source', autocompletion: false, searchKeymap: true }}
                   onChange={(v) => { setText(doc.path, v); engine.edit(doc.path, v) }}
-                  placeholder={presentation === 'notion' ? '書きはじめる…(改行すると見出し・リストなどを選べる)' : 'ここから書きはじめる…  / で見出しやリスト、[[ でノートへのリンク'}
+                  placeholder={presentation === 'notion' ? '書きはじめる…(改行すると見出し・リストなどを選べる)' : '書きはじめる…   / で見出しやリスト、[[ でリンク'}
                 />
                 {showCommands && <div className="command-menu" style={{ top: menuPos.top, left: menuPos.left }}>
                   <div className="command-heading">{menuKind === 'block' ? 'ブロックにする' : '挿入'} <span>↑↓ · Enter · Esc</span></div>
@@ -600,37 +642,34 @@ export default function App() {
             </article>
           </> : <div className="welcome">
             {notice && <div className="notice">{notice}<button onClick={() => setNotice('')} aria-label="閉じる"><X size={14} /></button></div>}
-            <h1>memo</h1>
-            <p>{loading ? '開いています…' : apiOk === false ? 'サーバーにつながりません。つながると一覧が出ます。' : '左の一覧からノートを選ぶか、探してください。'}</p>
+            <p className="welcome-lead">{loading ? '開いています…' : apiOk === false ? 'サーバーにつながりません。つながると一覧が出ます。' : '何を書きますか'}</p>
             <div className="welcome-actions">
-              <button className="btn primary" onClick={() => setSwitcher('')}><Search size={15} /> ノートを探す</button>
-              <button className="btn" onClick={() => openNewNote()}><FilePlus2 size={15} /> 新しいメモ・タスク</button>
+              <button className="btn primary" onClick={() => openNewNote()}><FilePlus2 size={15} /> 新しいメモ</button>
+              <button className="btn" onClick={() => setSwitcher('')}><Search size={15} /> 探す</button>
             </div>
-            {recent.length > 0 && <><h2>新しいメモ(date の新しい順)</h2>
-              <div className="recent">{recent.map((n) => <button key={n.path} onClick={() => openNote(n.path)}><b>{n.name}</b><small>{n.path}</small></button>)}</div></>}
+            {recent.length > 0 && <><h2>新しいメモ</h2>
+              <div className="recent">{recent.map((n) => <button key={n.path} onClick={() => openNote(n.path)}><b>{n.name}</b><small>{n.date?.slice(0, 10)}</small></button>)}</div></>}
           </div>}
         </main>
       </div>
 
       {settings && <div className="settings-popover">
         <div className="settings-head"><span className="settings-title">設定</span><button className="icon-button" onClick={() => setSettings(false)} aria-label="閉じる"><X size={16} /></button></div>
-        <div className="settings-row"><div><strong>表示</strong><small>どれも書いたまま保存。見た目だけ変わる</small></div><select value={presentation} onChange={(e) => choosePresentation(e.target.value as Presentation)}>{PRESENTATIONS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</select></div>
+        <div className="settings-row"><div><strong>表示</strong><small>どれも書いたまま保存。見た目だけ変わる(Ctrl+E でソースと切りかえ)</small></div><select value={presentation} onChange={(e) => choosePresentation(e.target.value as Presentation)}>{PRESENTATIONS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</select></div>
         <div className="settings-row"><div><strong>Obsidian の保管庫名</strong><small>「Obsidian で開く」に使う</small></div><input value={vaultName} onChange={(e) => { setVaultName(e.target.value); store('obsidian.vault', e.target.value) }} /></div>
         <div className="settings-row"><div><strong>送信待ち</strong><small>端末に残っていて、サーバーの確認がまだのもの</small></div><span className="setting-value">{pending}件 {pending > 0 && <button className="btn tiny" onClick={() => engine.saveNow()}>今すぐ送る</button>}</span></div>
-        <div className="settings-row"><div><strong>キー</strong><small>Ctrl+K 探す · Alt+N 新しいノート · Ctrl+S すぐ保存 · / 候補 · [[ リンク</small></div></div>
+        <div className="settings-row"><div><strong>キー</strong><small>Ctrl+K 探す · Alt+N 新しいメモ · Ctrl+S すぐ保存 · Ctrl+E ソース · / 候補 · [[ リンク</small></div></div>
       </div>}
-
-      <footer className="bottom-status">
-        <span>{sync ? <>{STATUS_ICON[sync.status]} {STATUS_LABEL[sync.status]}</> : ''}{pending > 0 && <em> · 送信待ち {pending}件</em>}</span>
-        <span>{active}</span>
-        <span>UTF-8 · Markdown</span>
-      </footer>
 
       {switcher !== null && <QuickSwitcher notes={notes} initial={switcher} onClose={() => setSwitcher(null)} onOpen={(p) => { setSwitcher(null); void openNote(p) }} onCreate={(name) => openNewNote(name)} />}
       {newNote && <NewNoteDialog folders={folders} defaultFolder={newNote.folder} defaultName={newNote.name} onClose={() => setNewNote(null)} onCreate={(f, n, kind, day, tags) => createNote(f, n, newNoteContent(kind, { day, tags }))} />}
       {diff && <DiffDialog mine={diff.mine} server={diff.server} onClose={() => setDiff(null)} />}
-      {ctx && <Dropdown at={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)} items={[
+      {ctx && <Dropdown at={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)} items={ctx.folder ? [
+        { label: isFav(ctx.path) ? 'お気に入りから外す' : 'お気に入りにする', onClick: () => void toggleFav(ctx.path, 'folder') },
+        { label: 'このフォルダに新しく作る', onClick: () => openNewNote('', ctx.path) },
+      ] : [
         { label: '開く', onClick: () => void openNote(ctx.path) },
+        { label: isFav(ctx.path) ? 'お気に入りから外す' : 'お気に入りにする', onClick: () => void toggleFav(ctx.path, 'note') },
         { label: 'パスをコピー', onClick: async () => { try { await navigator.clipboard.writeText(ctx.path); setToast({ text: 'パスをコピーしました' }) } catch { window.prompt('パス', ctx.path) } } },
         'sep',
         { label: '整理待ちへ移す(消す)…', danger: true, onClick: () => askDelete(ctx.path) },

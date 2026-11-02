@@ -209,3 +209,15 @@ def test_tree_skips_venv_and_hidden(client, vault):
         (vault / d / "README.md").write_text("x", encoding="utf-8")
     paths = [i["path"] for i in client.get("/api/tree").json()["items"]]
     assert not any(p.startswith(("venv/", ".git/", ".obsidian/", "node_modules/")) for p in paths)
+
+
+def test_favorites_roundtrip(client, vault):
+    assert client.post("/api/favorites", json={"path": "めも", "kind": "folder"}).status_code == 200
+    assert client.post("/api/favorites", json={"path": "a.md", "kind": "note"}).status_code == 200
+    client.post("/api/favorites", json={"path": "a.md", "kind": "note"})  # 2回でも1件
+    items = client.get("/api/favorites").json()["items"]
+    assert items == [{"path": "めも", "kind": "folder"}, {"path": "a.md", "kind": "note"}]
+    assert client.request("DELETE", "/api/favorites", params={"path": "a.md"}).status_code == 200
+    assert client.get("/api/favorites").json()["items"] == [{"path": "めも", "kind": "folder"}]
+    assert client.post("/api/favorites", json={"path": "../x", "kind": "note"}).status_code == 400
+    assert sorted(os.listdir(vault)) == ["a.md"]  # Vault には何も書かない

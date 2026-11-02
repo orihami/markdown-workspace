@@ -48,7 +48,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "If-Match", "X-Mutation-Id"],
 )
 
@@ -116,6 +116,9 @@ def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS mutations (mutation_id TEXT PRIMARY KEY, path TEXT NOT NULL, etag TEXT NOT NULL, saved_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS favorites (path TEXT PRIMARY KEY, kind TEXT NOT NULL, added_at TEXT NOT NULL)"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trash (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, moved_to TEXT NOT NULL, etag TEXT NOT NULL, moved_at TEXT NOT NULL, restored_at TEXT)"
@@ -610,6 +613,44 @@ def restore_note(trash_id: int):
     except OSError:
         pass
     return {"ok": True, "path": row[0]}
+
+
+# ---- お気に入り(どの端末からも同じ。Vault のファイルや Obsidian の設定には書かない) ----
+
+class FavoriteRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=400)
+    kind: str = Field(pattern="^(note|folder)$")
+
+
+def clean_rel(path: str) -> str:
+    pure = PurePosixPath(path.replace("\\", "/").strip("/"))
+    if pure.is_absolute() or not pure.parts or any(p in ("", ".", "..") for p in pure.parts):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    return pure.as_posix()
+
+
+@app.get("/api/favorites", dependencies=[Depends(require_auth)])
+def list_favorites():
+    with db() as conn:
+        rows = conn.execute("SELECT path, kind FROM favorites ORDER BY added_at").fetchall()
+    return {"items": [{"path": r[0], "kind": r[1]} for r in rows]}
+
+
+@app.post("/api/favorites", dependencies=[Depends(require_auth)])
+def add_favorite(body: FavoriteRequest):
+    path = clean_rel(body.path)
+    with db() as conn:
+        conn.execute("INSERT OR IGNORE INTO favorites(path, kind, added_at) VALUES (?, ?, ?)", (path, body.kind, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    return list_favorites()
+
+
+@app.delete("/api/favorites", dependencies=[Depends(require_auth)])
+def remove_favorite(path: str):
+    with db() as conn:
+        conn.execute("DELETE FROM favorites WHERE path = ?", (clean_rel(path),))
+        conn.commit()
+    return list_favorites()
 
 
 # ---- フロントエンド(ビルド済み)を同じポートで配る ----

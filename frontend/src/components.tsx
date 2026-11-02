@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { CheckSquare, ChevronRight, FileText, Folder, FolderOpen, Search, Square, X } from 'lucide-react'
 import { api, Note, SearchHit } from './api'
-import { MEMO_FOLDER, parseFront, SortName, sortNotes, tagLine, today } from './memo'
+import { addProps, Change, MEMO_FOLDER, parseFront, setProp, setTags, SortName, sortNotes, tagLine, today } from './memo'
 
 // ---- フォルダの木 ----
 
@@ -42,13 +42,14 @@ export function folderList(notes: Note[]): string[] {
   return [...set].sort((a, b) => a.localeCompare(b, 'ja'))
 }
 
-export function Tree({ node, open, toggle, active, onOpen, onContext, sort, depth = 0 }: {
+export function Tree({ node, open, toggle, active, onOpen, onContext, onFolderContext, sort, depth = 0 }: {
   node: TreeNode
   open: Set<string>
   toggle: (path: string) => void
   active: string
   onOpen: (path: string) => void
   onContext?: (path: string, x: number, y: number) => void // 右クリック・長押し
+  onFolderContext?: (path: string, x: number, y: number) => void
   sort: SortName
   depth?: number
 }) {
@@ -59,12 +60,12 @@ export function Tree({ node, open, toggle, active, onOpen, onContext, sort, dept
         const isOpen = open.has(f.path)
         return (
           <div key={f.path}>
-            <button className="tree-folder" style={{ paddingLeft: 8 + depth * 14 }} onClick={() => toggle(f.path)} aria-expanded={isOpen}>
+            <button className="tree-folder" style={{ paddingLeft: 8 + depth * 14 }} onClick={() => toggle(f.path)} onContextMenu={(e) => { if (!onFolderContext) return; e.preventDefault(); onFolderContext(f.path, e.clientX, e.clientY) }} aria-expanded={isOpen}>
               <ChevronRight size={14} className={`chev ${isOpen ? 'open' : ''}`} />
               {isOpen ? <FolderOpen size={15} /> : <Folder size={15} />}
               <span>{f.name}</span>
             </button>
-            {isOpen && <Tree node={f} open={open} toggle={toggle} active={active} onOpen={onOpen} onContext={onContext} sort={sort} depth={depth + 1} />}
+            {isOpen && <Tree node={f} open={open} toggle={toggle} active={active} onOpen={onOpen} onContext={onContext} onFolderContext={onFolderContext} sort={sort} depth={depth + 1} />}
           </div>
         )
       })}
@@ -302,11 +303,12 @@ export function Dropdown({ items, onClose, at }: { items: MenuItem[]; onClose: (
   )
 }
 
-// ---- プロパティの欄(Obsidian のプロパティ表示のように)。原文の該当する値だけを書きかえる ----
+// ---- タイトルの下の小さな1行(日付・タグ)。プロパティは本文ではないので控えめに。
+//      ほかのプロパティは「詳しく」で広げる。どれも原文の値の部分だけを書きかえる ----
 
-export type TextChange = { from: number; to?: number; insert: string }
+export type TextChange = Change
 
-export function PropsPanel({ text, memo, fileDate, onEdit }: {
+export function NoteMeta({ text, memo, fileDate, onEdit }: {
   text: string
   memo: boolean // めもフォルダのノートか(date が必須)
   fileDate: string
@@ -314,79 +316,48 @@ export function PropsPanel({ text, memo, fileDate, onEdit }: {
 }) {
   const fm = parseFront(text)
   const tl = tagLine(text)
-  const [newTag, setNewTag] = useState('')
-  const eol = text.includes('\r\n') ? '\r\n' : '\n'
   const props = fm?.props ?? []
-  const has = (k: string) => props.some((p) => p.key === k)
-  const setValue = (p: (typeof props)[number], v: string) => {
-    const q = p.quote || (/^\d{4}-\d{2}-\d{2}$/.test(v) && p.key === 'date' ? "'" : '')
-    onEdit([{ from: p.valueFrom, to: p.valueTo, insert: q + v + q }])
-  }
-  // プロパティを足す: 閉じ --- の前に。無ければ先頭に --- を作る(本文の前は空行1行)
-  const addProps = (lines: string[]) => {
-    if (fm) {
-      const closeStart = fm.to - fm.lines[fm.closeLine].replace(/\r$/, '').length
-      onEdit([{ from: closeStart, insert: lines.map((l) => l + eol).join('') }])
-    } else onEdit([{ from: 0, insert: `---${eol}${lines.map((l) => l + eol).join('')}---${eol}${text.startsWith('\n') || text.startsWith('\r\n') ? '' : eol}` }])
-  }
-  const makeTask = () => {
-    // タスクの並び(遂行日・完了・date)。date の前に入れる
-    const date = props.find((p) => p.key === 'date')
-    const add = [`遂行日: ${today()}`, '完了: false']
-    if (date && fm) {
-      const start = text.lastIndexOf('\n', date.valueFrom) + 1
-      onEdit([{ from: start, insert: add.map((l) => l + eol).join('') }])
-    } else addProps([...add, `date: '${today()}'`])
-  }
-  const writeTags = (tags: string[]) => {
-    const line = tags.map((t) => '#' + t).join(' ')
-    if (tl) onEdit([{ from: tl.from, to: tl.to, insert: line }])
-    else if (fm) {
-      // 閉じ --- → 空行 → タグ → 空行 → 本文(あいだの空行だけを整える)
-      const ws = text.slice(fm.to).match(/^(\r?\n)*/)![0]
-      const body = text.length > fm.to + ws.length
-      onEdit([{ from: fm.to, to: fm.to + ws.length, insert: eol + eol + line + eol + (body ? eol : '') }])
-    }
-    else onEdit([{ from: 0, insert: line + eol + eol }])
-  }
+  const date = props.find((p) => p.key === 'date')
+  const others = props.filter((p) => !['date', '遂行日', '完了'].includes(p.key))
+  const [open, setOpen] = useState(false)
+  const [adding, setAdding] = useState(false)
+  const [newTag, setNewTag] = useState('')
+  const tags = tl?.tags ?? []
   const addTag = () => {
     const t = newTag.trim().replace(/^#/, '')
-    if (!t || /\s/.test(t) || /^\d+$/.test(t.replace(/\//g, ''))) return
-    const cur = tl?.tags ?? []
-    if (!cur.includes(t)) writeTags([...cur, t])
     setNewTag('')
+    setAdding(false)
+    if (!t || /\s/.test(t) || /^\d+$/.test(t.replace(/\//g, '')) || tags.includes(t)) return
+    onEdit(setTags(text, [...tags, t]))
   }
-  const missingDate = memo && !has('date')
+  const dateValue = date && /^\d{4}-\d{2}-\d{2}/.test(date.value) ? date.value.slice(0, 10) : ''
   return (
-    <div className={`props ${missingDate ? 'warn' : ''}`}>
-      {props.map((p) => (
-        <div className="prop" key={p.line}>
-          <span className="prop-key">{p.key}</span>
-          {p.complex
-            ? <span className="prop-ro" title="この値はソース表示で編集してください">{fm!.lines.slice(p.line + 1).filter((l, i, a) => /^\s/.test(l) && a.slice(0, i).every((x) => /^\s/.test(x))).map((l) => l.trim().replace(/^-\s*/, '')).join(', ') || '(ソースで編集)'}</span>
-            : p.key === '完了' || /^(true|false)$/i.test(p.value)
-              ? <input type="checkbox" checked={/^true$/i.test(p.value)} onChange={(e) => setValue(p, e.target.checked ? 'true' : 'false')} aria-label={p.key} />
-              : /^\d{4}-\d{2}-\d{2}$/.test(p.value) || p.key === 'date' || p.key === '遂行日'
-                ? <input type="date" value={/^\d{4}-\d{2}-\d{2}/.test(p.value) ? p.value.slice(0, 10) : ''} onChange={(e) => e.target.value && setValue(p, e.target.value)} aria-label={p.key} />
-                : <PropText value={p.value} onCommit={(v) => setValue(p, v)} />}
-        </div>
-      ))}
-      <div className="prop">
-        <span className="prop-key">タグ</span>
-        <span className="prop-tags">
-          {(tl?.tags ?? []).map((t) => <span key={t} className="tag-chip">#{t}<button onClick={() => writeTags(tl!.tags.filter((x) => x !== t))} aria-label={`#${t} を外す`}>×</button></span>)}
-          <input className="tag-input" value={newTag} onChange={(e) => setNewTag(e.target.value)} placeholder="+ タグ" onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { e.preventDefault(); addTag() } }} onBlur={addTag} />
-        </span>
-      </div>
-      <div className="prop-actions">
-        {missingDate && <>
-          <span className="prop-warn">めものきまり: date がありません</span>
-          <button className="btn tiny" onClick={() => addProps([`date: '${today()}'`])}>今日の日付で付ける</button>
-          {fileDate && fileDate !== today() && <button className="btn tiny" onClick={() => addProps([`date: '${fileDate}'`])}>ファイルの日付({fileDate})で付ける</button>}
-        </>}
-        {!missingDate && !has('date') && <button className="btn tiny" onClick={() => addProps([`date: '${today()}'`])}>+ date</button>}
-        {!has('遂行日') && !has('完了') && <button className="btn tiny" onClick={makeTask}>タスクにする</button>}
-      </div>
+    <div className="meta">
+      {date
+        ? <label className="meta-date" title="date(並べ替えに使う日付)">
+            <input type="date" value={dateValue} onChange={(e) => e.target.value && onEdit(setProp(text, 'date', e.target.value))} aria-label="date" />
+          </label>
+        : memo && <span className="meta-warn">date がありません
+            <button onClick={() => onEdit(addProps(text, [`date: '${today()}'`]))}>今日で付ける</button>
+            {fileDate && fileDate !== today() && <button onClick={() => onEdit(addProps(text, [`date: '${fileDate}'`]))}>{fileDate} で付ける</button>}
+          </span>}
+      {tags.map((t) => <span key={t} className="meta-tag">#{t}<button onClick={() => onEdit(setTags(text, tags.filter((x) => x !== t)))} aria-label={`#${t} を外す`}>×</button></span>)}
+      {adding
+        ? <input className="meta-tag-input" autoFocus value={newTag} onChange={(e) => setNewTag(e.target.value)} placeholder="タグ" onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { e.preventDefault(); addTag() } if (e.key === 'Escape') { setAdding(false); setNewTag('') } }} onBlur={addTag} />
+        : <button className="meta-add" onClick={() => setAdding(true)}>+ タグ</button>}
+      {others.length > 0 && <button className="meta-more" onClick={() => setOpen((v) => !v)} aria-expanded={open}>{open ? '閉じる' : `詳しく(${others.length})`}</button>}
+      {open && <div className="meta-props">
+        {others.map((p) => (
+          <div className="prop" key={p.line}>
+            <span className="prop-key">{p.key}</span>
+            {p.complex
+              ? <span className="prop-ro" title="この値はソース表示で編集してください">{fm!.lines.slice(p.line + 1).filter((l, i, a) => /^\s/.test(l) && a.slice(0, i).every((x) => /^\s/.test(x))).map((l) => l.trim().replace(/^-\s*/, '')).join(', ') || '(ソースで編集)'}</span>
+              : /^(true|false)$/i.test(p.value)
+                ? <input type="checkbox" checked={/^true$/i.test(p.value)} onChange={(e) => onEdit(setProp(text, p.key, e.target.checked ? 'true' : 'false'))} aria-label={p.key} />
+                : <PropText value={p.value} onCommit={(v) => onEdit(setProp(text, p.key, v))} />}
+          </div>
+        ))}
+      </div>}
     </div>
   )
 }

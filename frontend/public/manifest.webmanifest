@@ -3,7 +3,7 @@
   "short_name": "memo",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#ffffff",
-  "theme_color": "#6d4fe6",
+  "background_color": "#fbfaf7",
+  "theme_color": "#23211d",
   "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
 }

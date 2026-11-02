@@ -67,7 +67,8 @@ function build(view: EditorView, mode: LiveMode): { all: DecorationSet; atomic: 
   const fmEnd = frontmatterEnd(doc)
   // obsidian: カーソル(選択)のある行は原文を見せる
   const active = new Set<number>()
-  if (mode === 'obsidian') {
+  // 記号を見せるのは、エディタで書いているとき(フォーカスがあるとき)だけ。開いただけの時は整った見た目
+  if (mode === 'obsidian' && view.hasFocus) {
     for (const r of state.selection.ranges) {
       for (let n = doc.lineAt(r.from).number; n <= doc.lineAt(r.to).number; n++) active.add(n)
     }
@@ -191,7 +192,17 @@ function build(view: EditorView, mode: LiveMode): { all: DecorationSet; atomic: 
   return { all: Decoration.set([...decos, ...atomic], true), atomic: Decoration.set(atomic, true) }
 }
 
-// Obsidian・Notion表示では、先頭のプロパティ(---〜---)はエディタに出さず、上の「プロパティ」の欄で編集する。
+// プロパティとタグの行(閉じ --- → 空行 → #タグ だけの行)の終わり。タグの行が無ければプロパティの終わり
+function headEnd(doc: Text): number {
+  const fm = frontmatterEnd(doc)
+  if (!fm) return 0
+  let n = doc.lineAt(fm).number + 1
+  while (n <= doc.lines && doc.line(n).text.trim() === '') n++
+  if (n <= doc.lines && /^(#[^\s#]+\s*)+$/.test(doc.line(n).text.trim())) return doc.line(n).to
+  return fm
+}
+
+// Obsidian・Notion表示では、先頭のプロパティ(---〜---)とタグの行はエディタに出さず、タイトルの下の小さな行で編集する。
 // カーソルがプロパティの中に入って文字を打ち、YAML を壊さないよう、カーソルはプロパティのうしろへ寄せる
 const hideFront = StateField.define<DecorationSet>({
   create: (s) => frontDeco(s),
@@ -199,12 +210,12 @@ const hideFront = StateField.define<DecorationSet>({
   provide: (f) => [EditorView.decorations.from(f), EditorView.atomicRanges.of((v) => v.state.field(f))],
 })
 function frontDeco(state: EditorState) {
-  const end = frontmatterEnd(state.doc)
+  const end = headEnd(state.doc)
   return end ? Decoration.set([Decoration.replace({ block: true }).range(0, end)]) : Decoration.none
 }
 const keepCursorOutOfFront = EditorState.transactionFilter.of((tr) => {
   if (!tr.selection) return tr
-  const end = frontmatterEnd(tr.newDoc)
+  const end = headEnd(tr.newDoc)
   if (!end) return tr
   const after = Math.min(end + 1, tr.newDoc.length)
   const sel = tr.selection
@@ -222,7 +233,7 @@ export function livePreview(mode: LiveMode, onLink: LinkHandler) {
         ;({ all: this.decorations, atomic: this.atomic } = build(view, mode))
       }
       update(u: ViewUpdate) {
-        if (u.docChanged || u.viewportChanged || u.selectionSet || syntaxTree(u.state) !== syntaxTree(u.startState)) {
+        if (u.docChanged || u.viewportChanged || u.selectionSet || u.focusChanged || syntaxTree(u.state) !== syntaxTree(u.startState)) {
           ;({ all: this.decorations, atomic: this.atomic } = build(u.view, mode))
         }
       }

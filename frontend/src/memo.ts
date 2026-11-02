@@ -106,3 +106,58 @@ export function tagLine(text: string): { from: number; to: number; tags: string[
   if (!/^#[^\s#]/.test(line) || !/^(#[^\s#]+\s*)+$/.test(line.trim())) return null
   return { from: pos, to: pos + line.length, tags: line.trim().split(/\s+/).map((t) => t.slice(1)) }
 }
+
+// ---- プロパティを書きかえる(エディタに渡す変更を作るだけ。値の部分だけを置きかえる) ----
+
+export type Change = { from: number; to?: number; insert: string }
+const eolOf = (text: string) => (text.includes('\r\n') ? '\r\n' : '\n')
+
+export function propValue(text: string, key: string) {
+  return parseFront(text)?.props.find((p) => p.key === key)
+}
+
+export function setProp(text: string, key: string, value: string): Change[] {
+  const p = propValue(text, key)
+  if (!p) return addProps(text, [`${key}: ${key === 'date' ? `'${value}'` : value}`])
+  const q = p.quote || (key === 'date' && /^\d{4}-\d{2}-\d{2}$/.test(value) ? "'" : '')
+  return [{ from: p.valueFrom, to: p.valueTo, insert: q + value + q }]
+}
+
+// 閉じ --- の前に足す。プロパティが無ければ先頭に作る(本文の前は空行1行)
+export function addProps(text: string, lines: string[]): Change[] {
+  const eol = eolOf(text)
+  const fm = parseFront(text)
+  if (fm) {
+    const closeStart = fm.to - fm.lines[fm.closeLine].replace(/\r$/, '').length
+    return [{ from: closeStart, insert: lines.map((l) => l + eol).join('') }]
+  }
+  return [{ from: 0, insert: `---${eol}${lines.map((l) => l + eol).join('')}---${eol}${text.startsWith('\n') || text.startsWith('\r\n') ? '' : eol}` }]
+}
+
+// タスクにする: 遂行日・完了 を date の前に(タスクの並び 遂行日・完了・date)
+export function makeTask(text: string, day = today()): Change[] {
+  const eol = eolOf(text)
+  const date = propValue(text, 'date')
+  const add = [`遂行日: ${day}`, '完了: false']
+  if (date) return [{ from: text.lastIndexOf('\n', date.valueFrom) + 1, insert: add.map((l) => l + eol).join('') }]
+  return addProps(text, [...add, `date: '${today()}'`])
+}
+
+// タグの行: 閉じ --- → 空行 → #タグ → 空行 → 本文
+export function setTags(text: string, tags: string[]): Change[] {
+  const eol = eolOf(text)
+  const line = tags.map((t) => '#' + t).join(' ')
+  const tl = tagLine(text)
+  if (tl) {
+    if (tags.length) return [{ from: tl.from, to: tl.to, insert: line }]
+    // タグを全部外したら、タグの行とそのあとの空行1行をなくす(閉じ --- のあとの空行は残る)
+    const after = text.slice(tl.to).match(/^(\r?\n){0,2}/)![0]
+    return [{ from: tl.from, to: tl.to + after.length, insert: '' }]
+  }
+  if (!tags.length) return []
+  const fm = parseFront(text)
+  if (!fm) return [{ from: 0, insert: line + eol + eol }]
+  const ws = text.slice(fm.to).match(/^(\r?\n)*/)![0]
+  const body = text.length > fm.to + ws.length
+  return [{ from: fm.to, to: fm.to + ws.length, insert: eol + eol + line + eol + (body ? eol : '') }]
+}

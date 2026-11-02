@@ -1,0 +1,13 @@
+services:
+  api:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      VAULT_ROOT: /vault
+      APP_TOKEN: ${APP_TOKEN:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+    volumes:
+      - ${VAULT_HOST_PATH:-./sample-vault}:/vault
+      - ./state:/state
+    ports:
+      - "127.0.0.1:8000:8000"

@@ -323,3 +323,23 @@ button { font: inherit; }
 .tag-row:hover { background: var(--side-2); }
 .tag-row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tag-row small { color: var(--muted); font-size: 12px; background: #fff; border: 1px solid var(--line); border-radius: 999px; padding: 0 7px; }
+/* 消す(整理待ち) */
+.dropdown.floating { position: fixed; right: auto; }
+.dropdown button.danger { color: var(--bad); }
+.dropdown button.danger:hover { background: #fdeaea; color: var(--bad); }
+.btn.danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+.btn.danger:hover { background: #a52727; }
+.delete-where { margin: 0; font-size: 14px; color: var(--ink-2); line-height: 1.7; }
+.delete-where code { font-size: 12px; background: var(--side); padding: 1px 5px; border-radius: 5px; }
+.delete-path { margin: 0; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 12.5px; background: var(--side); border-radius: 8px; padding: 7px 9px; word-break: break-all; }
+.delete-info { margin: 0; font-size: 13px; color: var(--muted); }
+.delete-warn { margin: 0; font-size: 13px; color: #7a4f0e; background: #fff4e0; border: 1px solid #f0cf94; border-radius: 8px; padding: 7px 9px; }
+.trash-link { display: flex; align-items: center; gap: 6px; border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--muted); font-size: 12.5px; padding: 10px 8px 2px; margin-top: 6px; cursor: pointer; text-align: left; }
+.trash-link:hover { color: var(--ink); }
+.trash-list { overflow: auto; display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.trash-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; }
+.trash-row div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.trash-row small { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toast { position: fixed; left: 50%; bottom: 48px; transform: translateX(-50%); z-index: 30; display: flex; align-items: center; gap: 12px; background: #24213a; color: #fff; border-radius: 12px; padding: 10px 12px 10px 16px; box-shadow: 0 12px 32px rgba(20, 10, 60, 0.3); font-size: 14px; max-width: calc(100vw - 24px); }
+.toast button:not(.icon-button) { border: 0; background: #ffd23f; color: #24213a; font-weight: 700; border-radius: 8px; padding: 6px 12px; cursor: pointer; white-space: nowrap; }
+.toast .icon-button { color: #cfcbe6; }

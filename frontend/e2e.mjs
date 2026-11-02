@@ -24,6 +24,8 @@ writeFileSync(join(vault, 'めも', '新しいメモ.md'), "---\ndate: '2026-10-
 writeFileSync(join(vault, 'めも', 'タスクA.md'), `---\n遂行日: ${T}\n完了: false\ndate: '2026-10-01'\n---\n`)
 writeFileSync(join(vault, 'めも', '日付なし.md'), 'プロパティの無いメモ\n')
 writeFileSync(join(vault, 'めも', 'sortspec.md'), "---\ndate: '2026-09-13'\n---\n\n並べ替えの設定\n")
+const trashDir = join(work, '_整理待ち')
+mkdirSync(trashDir)
 const port = 18000 + Math.floor(Math.random() * 1000)
 const base = `http://127.0.0.1:${port}`
 const read = (p) => readFileSync(join(vault, p), 'utf8')
@@ -34,7 +36,7 @@ let apiProc
 function startApi() {
   apiProc = spawn(join(root, 'backend/.venv/bin/uvicorn'), ['app.main:app', '--host', '127.0.0.1', '--port', String(port)], {
     cwd: join(root, 'backend'),
-    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base },
+    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base, TRASH_ROOT: trashDir, VAULT_LABEL: 'OMNI' },
     stdio: 'ignore',
   })
   return waitFor(async () => (await fetch(base + '/api/health').catch(() => null))?.ok)
@@ -234,6 +236,38 @@ try {
   await page.press('.tag-input', 'Enter')
   await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })
   check(read('めも/新しいメモ.md') === "---\ndate: '2026-10-30'\n---\n\n#追加タグ\n\n新しい本文\n", 'プロパティの欄でタグを足すと、きまりの位置に入る')
+
+  // 消す: 右クリック → 確認(最初は「やめる」) → 整理待ちへ移す → 元に戻す
+  await page.click('.note-item:has-text("古いメモ")', { button: 'right' })
+  await page.click('.dropdown.floating button:has-text("整理待ちへ移す")')
+  await page.waitForSelector('[role="alertdialog"]')
+  check((await page.evaluate(() => document.activeElement?.textContent)) === 'やめる', '消す確認: 最初に選ばれているのは「やめる」')
+  await page.waitForSelector('.delete-info:has-text("リンクはありません"), .delete-warn:has-text("リンク")')
+  await page.keyboard.press('Escape')
+  check(!(await page.isVisible('[role="alertdialog"]')) && existsSync(join(vault, 'めも', '古いメモ.md')), '消す確認: Esc でやめると何も変わらない')
+  await page.click('.note-item:has-text("古いメモ")', { button: 'right' })
+  await page.click('.dropdown.floating button:has-text("整理待ちへ移す")')
+  await page.click('[role="alertdialog"] button:has-text("整理待ちへ移す")')
+  await page.waitForSelector('.toast:has-text("整理待ちへ移しました")')
+  const movedTo = join(trashDir, T, 'OMNI', 'めも', '古いメモ.md')
+  check(!existsSync(join(vault, 'めも', '古いメモ.md')) && existsSync(movedTo) && readFileSync(movedTo, 'utf8').includes('本文'), '消す: 本当には消さず _整理待ち/日付/OMNI/めも/ へそのまま移す')
+  check(readFileSync(join(trashDir, '整理ログ.md'), 'utf8').includes('`OMNI/めも/古いメモ.md` → `_整理待ち/' + T + '/OMNI/めも/古いメモ.md`'), '消す: 整理ログに「元パス → 新パス」を書く')
+  check(!(await page.isVisible('.note-item:has-text("古いメモ")')), '消す: 一覧から消える')
+  await page.click('.toast button:has-text("元に戻す")')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === '古いメモ')
+  check(existsSync(join(vault, 'めも', '古いメモ.md')) && !existsSync(movedTo), '「元に戻す」で元の場所に戻る')
+  // 開いているノートを三点メニューから消す → 整理待ちの一覧から戻す
+  await page.click('button[aria-label="ノートのメニュー"]')
+  await page.click('.dropdown button:has-text("整理待ちへ移す")')
+  await page.click('[role="alertdialog"] button:has-text("整理待ちへ移す")')
+  await page.waitForSelector('.welcome')
+  check(!existsSync(join(vault, 'めも', '古いメモ.md')), '三点メニューからも消せる(開いていたノートは閉じる)')
+  await page.click('.toast button[aria-label="閉じる"]')
+  await page.click('.trash-link')
+  await page.waitForSelector('.trash-row:has-text("古いメモ")')
+  await page.click('.trash-row:has-text("古いメモ") button:has-text("戻す")')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === '古いメモ')
+  check(existsSync(join(vault, 'めも', '古いメモ.md')) && readFileSync(join(trashDir, '整理ログ.md'), 'utf8').includes('戻した'), '整理待ちの一覧から戻せる(ログにも書く)')
 
   // API を止めても書ける → 保存済みにならない → 戻ると自動で送る
   await page.click('.note-item:has-text("はじめに")')

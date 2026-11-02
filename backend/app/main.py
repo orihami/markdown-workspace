@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import re
 import sqlite3
 import tempfile
@@ -28,6 +29,9 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 DB_PATH = Path(os.getenv("WORKSPACE_DB", "./workspace-state.sqlite3")).resolve()
+# 「消す」= 整理待ちへ移す(NAS のきまり: 削除はしない。_整理待ち/<日付>/ に元のパスのまま移し、整理ログ.md に書く)
+TRASH_ROOT = Path(os.getenv("TRASH_ROOT")).expanduser() if os.getenv("TRASH_ROOT") else None
+VAULT_LABEL = os.getenv("VAULT_LABEL") or VAULT_ROOT.name
 # ビルド済みのフロントエンド(frontend/dist)。あれば同じポートで配る
 FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", str(Path(__file__).resolve().parents[2] / "frontend" / "dist")))
 
@@ -112,6 +116,9 @@ def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS mutations (mutation_id TEXT PRIMARY KEY, path TEXT NOT NULL, etag TEXT NOT NULL, saved_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS trash (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, moved_to TEXT NOT NULL, etag TEXT NOT NULL, moved_at TEXT NOT NULL, restored_at TEXT)"
     )
     conn.commit()
     return conn
@@ -472,6 +479,136 @@ def tags():
             counts[tag] = counts.get(tag, 0) + 1
     items = sorted(({"tag": t, "count": c} for t, c in counts.items()), key=lambda x: (-x["count"], x["tag"].casefold()))
     return {"items": items}
+
+
+# ---- 整理待ち(消す・戻す) ----
+
+class TrashRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=400)
+    base_etag: Optional[str] = None
+
+
+_log_guard = threading.Lock()
+
+
+def trash_root() -> Path:
+    if TRASH_ROOT is None:
+        raise HTTPException(status_code=503, detail="整理待ちの場所が設定されていません")
+    try:
+        root = TRASH_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="整理待ちの場所が見つかりません(HDD が外れているかもしれません)") from exc
+    return root
+
+
+def move_verified(src: Path, dest: Path, expected: bytes) -> None:
+    """同じディスクなら rename(一瞬で、途中で壊れない)。ちがうディスクならコピーして中身を確かめてから元を消す"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.rename(src, dest)
+        return
+    except OSError as exc:
+        if exc.errno != 18:  # EXDEV(ちがうディスク)以外はそのまま失敗にする
+            raise
+    shutil.copy2(src, dest)
+    if hashlib.sha256(dest.read_bytes()).digest() != hashlib.sha256(expected).digest():
+        dest.unlink(missing_ok=True)
+        raise OSError("コピーした中身が一致しません")
+    src.unlink()
+
+
+def append_log(line: str) -> None:
+    """整理ログ.md に「元パス → 新パス」を書く(その日の見出しが最後になければ足す)"""
+    log = trash_root() / "整理ログ.md"
+    day = datetime.now().astimezone().strftime("%Y-%m-%d")
+    header = f"## {day}（ko-pi、Markdown Workspace で整理待ちへ移したノート）"
+    with _log_guard:
+        text = log.read_text(encoding="utf-8") if log.exists() else "# 整理ログ\n\n「元パス → 新パス」。元に戻すときは右から左へ移動する。\n"
+        headers = [l for l in text.splitlines() if l.startswith("## ")]
+        add = ""
+        if not headers or headers[-1] != header:
+            add += ("" if text.endswith("\n") else "\n") + "\n" + header + "\n"
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(add + line + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+
+@app.post("/api/trash", dependencies=[Depends(require_auth)])
+def trash_note(body: TrashRequest):
+    root = trash_root()
+    path = safe_note_path(body.path, must_exist=True)
+    vault = ensure_root()
+    rel = path.relative_to(vault).as_posix()
+    now = datetime.now().astimezone()
+    with lock_for(path):
+        raw = path.read_bytes()
+        etag = etag_for(raw)
+        # 開いたあとにほかの場所で書きかえられていたら止める(知らない内容を消さない)
+        if body.base_etag and body.base_etag != etag:
+            return JSONResponse(status_code=409, content={"detail": "ほかの場所でこのノートが更新されています。開き直してから消してください", "server_etag": etag})
+        dest = root / now.strftime("%Y-%m-%d") / VAULT_LABEL / rel
+        n = 1
+        while dest.exists():
+            dest = dest.with_name(f"{path.stem} ({now.strftime('%H%M%S')}-{n}){path.suffix}")
+            n += 1
+        try:
+            move_verified(path, dest, raw)
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail=f"移せませんでした: {exc}") from exc
+    moved_to = dest.relative_to(root).as_posix()
+    with db() as conn:
+        cur = conn.execute("INSERT INTO trash(path, moved_to, etag, moved_at) VALUES (?, ?, ?, ?)", (rel, moved_to, etag, now.isoformat()))
+        conn.commit()
+        trash_id = cur.lastrowid
+    shown = f"{root.name}/{moved_to}"
+    try:
+        append_log(f"- {now.strftime('%H:%M')} `{VAULT_LABEL}/{rel}` → `{shown}`")
+    except OSError:
+        pass  # ログが書けなくても移動は済んでいる(整理待ちの一覧と DB に残る)
+    with _text_cache_guard:
+        _text_cache.pop(rel, None)
+    return {"ok": True, "id": trash_id, "path": rel, "moved_to": shown}
+
+
+@app.get("/api/trash", dependencies=[Depends(require_auth)])
+def list_trash():
+    root = trash_root()
+    with db() as conn:
+        rows = conn.execute("SELECT id, path, moved_to, moved_at FROM trash WHERE restored_at IS NULL ORDER BY id DESC LIMIT 200").fetchall()
+    return {"items": [
+        {"id": r[0], "path": r[1], "name": Path(r[1]).stem, "moved_to": f"{root.name}/{r[2]}", "moved_at": r[3], "exists": (root / r[2]).is_file()}
+        for r in rows
+    ]}
+
+
+@app.post("/api/trash/{trash_id}/restore", dependencies=[Depends(require_auth)])
+def restore_note(trash_id: int):
+    root = trash_root()
+    with db() as conn:
+        row = conn.execute("SELECT path, moved_to, restored_at FROM trash WHERE id = ?", (trash_id,)).fetchone()
+    if not row or row[2]:
+        raise HTTPException(status_code=404, detail="戻せるものが見つかりません")
+    src = root / row[1]
+    if not src.is_file():
+        raise HTTPException(status_code=404, detail="整理待ちの中にファイルがありません(手で動かされたかもしれません)")
+    target = safe_note_path(row[0])
+    with lock_for(target):
+        if target.exists():
+            raise HTTPException(status_code=409, detail="元の場所に同じ名前のノートがあります")
+        try:
+            move_verified(src, target, src.read_bytes())
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail=f"戻せませんでした: {exc}") from exc
+    now = datetime.now().astimezone()
+    with db() as conn:
+        conn.execute("UPDATE trash SET restored_at = ? WHERE id = ?", (now.isoformat(), trash_id))
+        conn.commit()
+    try:
+        append_log(f"- {now.strftime('%H:%M')} 戻した: `{root.name}/{row[1]}` → `{VAULT_LABEL}/{row[0]}`")
+    except OSError:
+        pass
+    return {"ok": True, "path": row[0]}
 
 
 # ---- フロントエンド(ビルド済み)を同じポートで配る ----

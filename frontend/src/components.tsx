@@ -42,12 +42,13 @@ export function folderList(notes: Note[]): string[] {
   return [...set].sort((a, b) => a.localeCompare(b, 'ja'))
 }
 
-export function Tree({ node, open, toggle, active, onOpen, sort, depth = 0 }: {
+export function Tree({ node, open, toggle, active, onOpen, onContext, sort, depth = 0 }: {
   node: TreeNode
   open: Set<string>
   toggle: (path: string) => void
   active: string
   onOpen: (path: string) => void
+  onContext?: (path: string, x: number, y: number) => void // 右クリック・長押し
   sort: SortName
   depth?: number
 }) {
@@ -63,12 +64,12 @@ export function Tree({ node, open, toggle, active, onOpen, sort, depth = 0 }: {
               {isOpen ? <FolderOpen size={15} /> : <Folder size={15} />}
               <span>{f.name}</span>
             </button>
-            {isOpen && <Tree node={f} open={open} toggle={toggle} active={active} onOpen={onOpen} sort={sort} depth={depth + 1} />}
+            {isOpen && <Tree node={f} open={open} toggle={toggle} active={active} onOpen={onOpen} onContext={onContext} sort={sort} depth={depth + 1} />}
           </div>
         )
       })}
       {sortNotes(node.notes, sort, day).map((n) => (
-        <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''} ${n.task ? 'task' : ''} ${n.done ? 'done' : ''}`} style={{ paddingLeft: 8 + depth * 14 + 16 }} onClick={() => onOpen(n.path)} title={`${n.path}${n.date ? `\ndate: ${n.date}` : ''}${n.task_day ? `\n遂行日: ${n.task_day}` : ''}`}>
+        <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''} ${n.task ? 'task' : ''} ${n.done ? 'done' : ''}`} style={{ paddingLeft: 8 + depth * 14 + 16 }} onClick={() => onOpen(n.path)} onContextMenu={(e) => { if (!onContext) return; e.preventDefault(); onContext(n.path, e.clientX, e.clientY) }} title={`${n.path}${n.date ? `\ndate: ${n.date}` : ''}${n.task_day ? `\n遂行日: ${n.task_day}` : ''}`}>
           {n.task ? (n.done ? <CheckSquare size={15} className="file-icon" /> : <Square size={15} className="file-icon" />) : <FileText size={15} className="file-icon" />}
           <span>{n.name}</span>
           {sort.startsWith('遂行日') || sort === 'おすすめ'
@@ -283,7 +284,7 @@ export function DiffDialog({ mine, server, onClose }: { mine: string; server: st
 
 export type MenuItem = { label: string; onClick: () => void; disabled?: boolean; danger?: boolean } | 'sep'
 
-export function Dropdown({ items, onClose }: { items: MenuItem[]; onClose: () => void }) {
+export function Dropdown({ items, onClose, at }: { items: MenuItem[]; onClose: () => void; at?: { x: number; y: number } }) {
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const away = (e: MouseEvent) => { if (!ref.current?.contains(e.target as Node)) onClose() }
@@ -293,7 +294,7 @@ export function Dropdown({ items, onClose }: { items: MenuItem[]; onClose: () =>
     return () => { document.removeEventListener('mousedown', away); document.removeEventListener('keydown', esc) }
   }, [onClose])
   return (
-    <div className="dropdown" ref={ref} role="menu">
+    <div className={`dropdown ${at ? 'floating' : ''}`} ref={ref} role="menu" style={at ? { left: Math.min(at.x, window.innerWidth - 250), top: Math.min(at.y, window.innerHeight - 160) } : undefined}>
       {items.map((it, k) => it === 'sep'
         ? <div key={k} className="dropdown-sep" />
         : <button key={k} role="menuitem" disabled={it.disabled} className={it.danger ? 'danger' : ''} onClick={() => { onClose(); it.onClick() }}>{it.label}</button>)}
@@ -394,4 +395,78 @@ function PropText({ value, onCommit }: { value: string; onCommit: (v: string) =>
   const [v, setV] = useState(value)
   useEffect(() => setV(value), [value])
   return <input className="prop-text" value={v} onChange={(e) => setV(e.target.value)} onBlur={() => v !== value && onCommit(v)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) (e.target as HTMLInputElement).blur() }} />
+}
+
+// ---- 消す(整理待ちへ移す)。本当には消さず、あとから戻せる ----
+
+export function DeleteDialog({ path, name, unsaved, busy, links, onSaveNow, onConfirm, onClose }: {
+  path: string
+  name: string
+  unsaved: boolean // 保存がまだ終わっていない
+  busy: boolean
+  links: number | null // このノートへのリンクの数(調べ中は null)
+  onSaveNow: () => void
+  onConfirm: () => void
+  onClose: () => void
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null)
+  useEffect(() => { cancelRef.current?.focus() }, [])
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose} onKeyDown={(e) => { if (e.key === 'Escape') onClose() }}>
+      <div className="modal small" onMouseDown={(e) => e.stopPropagation()} role="alertdialog" aria-label="ノートを消す">
+        <h2>「{name}」を消しますか？</h2>
+        <p className="delete-where">本当には消しません。<b>整理待ち</b>(<code>_整理待ち/今日の日付/</code>)へ元の場所のまま移し、整理ログに書きます。あとから「整理待ち」から戻せます。</p>
+        <p className="delete-path">{path}</p>
+        {links === null ? <p className="delete-info">このノートへのリンクを調べています…</p>
+          : links > 0 ? <p className="delete-warn">ほかの {links} 件のノートからリンクされています(リンクの文字はそのまま残ります)</p>
+          : <p className="delete-info">このノートへのリンクはありません</p>}
+        {unsaved && <p className="delete-warn">まだサーバーに保存されていない変更があります。保存が終わってから消せます。 <button type="button" className="btn tiny" onClick={onSaveNow}>今すぐ保存</button></p>}
+        <div className="modal-actions">
+          <button type="button" className="btn" ref={cancelRef} onClick={onClose}>やめる</button>
+          <button type="button" className="btn danger" disabled={unsaved || busy} onClick={onConfirm}>{busy ? '移しています…' : '整理待ちへ移す'}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export type TrashItem = { id: number; path: string; name: string; moved_to: string; moved_at: string; exists: boolean }
+
+export function TrashDialog({ onRestore, onClose }: { onRestore: (item: TrashItem) => Promise<string | null>; onClose: () => void }) {
+  const [items, setItems] = useState<TrashItem[] | null>(null)
+  const [error, setError] = useState('')
+  const load = async () => {
+    try { setItems((await api<{ items: TrashItem[] }>('/api/trash')).items) } catch (e) { setError((e as Error).message); setItems([]) }
+  }
+  useEffect(() => { void load() }, [])
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="modal wide" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label="整理待ち">
+        <div className="modal-head"><h2>整理待ち</h2><button className="icon-button" onClick={onClose} aria-label="閉じる"><X size={16} /></button></div>
+        <p className="delete-info">このアプリで消したノートです。本当に消すときは、ファイルの整理のときに整理待ちから消してください(ここからは消しません)。</p>
+        {error && <p className="field-error">{error}</p>}
+        <div className="trash-list">
+          {items === null && <p className="delete-info">読みこんでいます…</p>}
+          {items?.length === 0 && !error && <p className="delete-info">整理待ちはありません</p>}
+          {items?.map((it) => (
+            <div key={it.id} className="trash-row">
+              <div><b>{it.name}</b><small>{it.path} · {new Date(it.moved_at).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</small><small>→ {it.moved_to}</small></div>
+              <button className="btn tiny" disabled={!it.exists} onClick={async () => { const err = await onRestore(it); if (err) setError(err); else void load() }}>{it.exists ? '戻す' : '見つかりません'}</button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function Toast({ text, action, onAction, onClose }: { text: string; action?: string; onAction?: () => void; onClose: () => void }) {
+  useEffect(() => { const t = setTimeout(onClose, 10000); return () => clearTimeout(t) }, [text, onClose])
+  return (
+    <div className="toast" role="status">
+      <span>{text}</span>
+      {action && <button onClick={() => { onAction?.(); onClose() }}>{action}</button>}
+      <button className="icon-button tiny" onClick={onClose} aria-label="閉じる"><X size={14} /></button>
+    </div>
+  )
 }

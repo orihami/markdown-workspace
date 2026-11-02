@@ -136,3 +136,68 @@ def test_tree_has_sort_props(client, vault):
     assert items["t.md"]["done"] is False and items["t.md"]["task"] is True
     assert items["n.md"]["has_props"] is False and "date" not in items["n.md"]
     assert items["a.md"]["has_props"] is True
+
+
+@pytest.fixture
+def trash(tmp_path, monkeypatch):
+    t = tmp_path / "_整理待ち"
+    t.mkdir()
+    monkeypatch.setattr(main, "TRASH_ROOT", t)
+    monkeypatch.setattr(main, "VAULT_LABEL", "OMNI")
+    return t
+
+
+def test_trash_moves_not_deletes_and_logs(client, vault, trash):
+    (vault / "めも").mkdir()
+    note = vault / "めも" / "消す.md"
+    note.write_text("中身", encoding="utf-8")
+    etag = client.get("/api/notes/めも/消す.md").json()["etag"]
+    r = client.post("/api/trash", json={"path": "めも/消す.md", "base_etag": etag})
+    assert r.status_code == 200, r.text
+    assert not note.exists()
+    moved = list(trash.rglob("消す.md"))
+    assert len(moved) == 1 and moved[0].read_text(encoding="utf-8") == "中身"
+    assert moved[0].relative_to(trash).parts[1:] == ("OMNI", "めも", "消す.md")
+    log = (trash / "整理ログ.md").read_text(encoding="utf-8")
+    assert "`OMNI/めも/消す.md` → `_整理待ち/" in log and "Markdown Workspace" in log
+    # 一覧に出て、戻せる
+    items = client.get("/api/trash").json()["items"]
+    assert items[0]["path"] == "めも/消す.md" and items[0]["exists"]
+    assert client.post(f"/api/trash/{items[0]['id']}/restore").status_code == 200
+    assert note.read_text(encoding="utf-8") == "中身"
+    assert client.get("/api/trash").json()["items"] == []
+    assert "戻した" in (trash / "整理ログ.md").read_text(encoding="utf-8")
+
+
+def test_trash_refuses_if_changed_elsewhere(client, vault, trash):
+    etag = client.get("/api/notes/a.md").json()["etag"]
+    (vault / "a.md").write_text("ほかで書きかえた", encoding="utf-8")
+    r = client.post("/api/trash", json={"path": "a.md", "base_etag": etag})
+    assert r.status_code == 409
+    assert (vault / "a.md").exists()
+
+
+def test_trash_same_name_twice_keeps_both(client, vault, trash):
+    for text in ("1", "2"):
+        (vault / "x.md").write_text(text, encoding="utf-8")
+        assert client.post("/api/trash", json={"path": "x.md"}).status_code == 200
+    contents = sorted(p.read_text(encoding="utf-8") for p in trash.rglob("x*.md"))
+    assert contents == ["1", "2"]
+
+
+def test_restore_does_not_overwrite(client, vault, trash):
+    assert client.post("/api/trash", json={"path": "a.md"}).status_code == 200
+    (vault / "a.md").write_text("新しく作った", encoding="utf-8")
+    tid = client.get("/api/trash").json()["items"][0]["id"]
+    assert client.post(f"/api/trash/{tid}/restore").status_code == 409
+    assert (vault / "a.md").read_text(encoding="utf-8") == "新しく作った"
+
+
+def test_trash_needs_configured_place(client, vault, monkeypatch):
+    monkeypatch.setattr(main, "TRASH_ROOT", None)
+    assert client.post("/api/trash", json={"path": "a.md"}).status_code == 503
+    assert (vault / "a.md").exists()
+
+
+def test_trash_rejects_escape(client, vault, trash):
+    assert client.post("/api/trash", json={"path": "../x.md"}).status_code == 400

@@ -197,6 +197,23 @@ export class SaveEngine {
     this.schedule(path, 0)
   }
 
+  // 消す前の確かめ用: いまの内容のもとにしたサーバーの版
+  baseOf(path: string) {
+    return this.base.get(path)
+  }
+
+  // 整理待ちへ移したノート: 送信待ちと予定を片づける(もう送らない)
+  async forget(path: string) {
+    clearTimeout(this.timers.get(path))
+    this.timers.delete(path)
+    this.again.delete(path)
+    await this.writes.get(path)
+    await dropOutbox(path)
+    this.base.delete(path)
+    this.info.delete(path)
+    this.emit()
+  }
+
   async mineContent(path: string) {
     return (await getOutbox(path))?.content ?? null
   }

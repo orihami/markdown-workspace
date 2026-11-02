@@ -3,12 +3,12 @@ import CodeMirror, { ReactCodeMirrorRef } from '@uiw/react-codemirror'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorView, keymap } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
-import { AlertTriangle, BookOpen, Check, CircleDot, CloudOff, Command, FilePlus2, Folder, Hash, Loader2, Menu, MoreHorizontal, PenLine, Search, Settings2, Sparkles, Wifi, WifiOff, X } from 'lucide-react'
+import { AlertTriangle, BookOpen, Check, CircleDot, CloudOff, Command, FilePlus2, Folder, Hash, Loader2, Menu, MoreHorizontal, PenLine, Search, Settings2, Sparkles, Trash2, Wifi, WifiOff, X } from 'lucide-react'
 import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode } from './livePreview'
 import { workspaceCompletions } from './completions'
-import { buildTree, DiffDialog, Dropdown, folderList, MenuItem, NewNoteDialog, PropsPanel, QuickSwitcher, TextChange, Tree } from './components'
+import { buildTree, DeleteDialog, DiffDialog, Dropdown, folderList, MenuItem, NewNoteDialog, PropsPanel, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree } from './components'
 import { inMemoFolder, MEMO_FOLDER, newNoteContent, parseFront, SortName, sortNotes, SORTS } from './memo'
 
 // 表示(仕様 4.3)。どれも同じエディタで直接書き、ファイルの中身は変えない(見た目だけ)
@@ -78,6 +78,13 @@ export default function App() {
   const [sort, setSort] = useState<SortName>(() => { const v = load('tree.sort', '日付が新しい順') as SortName; return SORTS.includes(v) ? v : '日付が新しい順' })
   // プロパティの欄に出すための、ノートの先頭部分(プロパティとタグの行)
   const [head, setHead] = useState('')
+  // 消す(整理待ちへ移す)
+  const [del, setDel] = useState<string | null>(null)
+  const [delBusy, setDelBusy] = useState(false)
+  const [delLinks, setDelLinks] = useState<number | null>(null)
+  const [trashOpen, setTrashOpen] = useState(false)
+  const [toast, setToast] = useState<{ text: string; action?: string; onAction?: () => void } | null>(null)
+  const [ctx, setCtx] = useState<{ path: string; x: number; y: number } | null>(null)
 
   const editorRef = useRef<ReactCodeMirrorRef>(null)
   const notesRef = useRef(notes)
@@ -400,6 +407,8 @@ export default function App() {
     'sep',
     { label: 'このフォルダに新しく作る', onClick: () => openNewNote('', folderOf(active)) },
     'sep',
+    { label: '整理待ちへ移す(消す)…', danger: true, onClick: () => askDelete(active) },
+    'sep',
     ...PRESENTATIONS.map((p) => ({ label: `${presentation === p.id ? '✓ ' : '　'}${p.label}`, onClick: () => choosePresentation(p.id) })),
   ] : []
 
@@ -408,6 +417,55 @@ export default function App() {
     const view = editorRef.current?.view
     if (!view) return
     view.dispatch({ changes, userEvent: 'input.props' })
+  }
+
+  // ---- 消す: 整理待ちへ移す(本当には消さない)。確認の画面を出し、あとから戻せる ----
+  const askDelete = (path: string) => {
+    setCtx(null)
+    setNoteMenu(false)
+    setDel(path)
+    setDelLinks(null)
+    const name = nameOf(path)
+    api<{ items: { path: string }[] }>(`/api/search?q=${encodeURIComponent('[[' + name)}&limit=200`)
+      .then((r) => setDelLinks(r.items.filter((i) => i.path !== path).length))
+      .catch(() => setDelLinks(0))
+  }
+  const confirmDelete = async () => {
+    const path = del
+    if (!path) return
+    setDelBusy(true)
+    try {
+      const r = await api<{ id: number; moved_to: string }>('/api/trash', { method: 'POST', body: JSON.stringify({ path, base_etag: engine.baseOf(path) ?? null }) })
+      await engine.forget(path)
+      setNotes((list) => list.filter((n) => n.path !== path))
+      if (activeRef.current === path) {
+        setActive('')
+        setDoc(null)
+        store('last.note', '')
+        history.replaceState(null, '', '#/')
+      }
+      setDel(null)
+      setToast({ text: `「${nameOf(path)}」を整理待ちへ移しました`, action: '元に戻す', onAction: () => void restoreNote({ id: r.id, path } as TrashItem) })
+    } catch (e) {
+      const err = e as ApiError
+      setDel(null)
+      setNotice(err.status === 409 ? 'ほかの場所でこのノートが更新されていたので、消すのをやめました。開き直して中身を確かめてください' : `消せませんでした: ${err.message}`)
+    } finally {
+      setDelBusy(false)
+    }
+  }
+  const restoreNote = async (item: TrashItem): Promise<string | null> => {
+    try {
+      await api(`/api/trash/${item.id}/restore`, { method: 'POST' })
+    } catch (e) {
+      const err = e as ApiError
+      setToast({ text: `戻せませんでした: ${err.message}` })
+      return err.message
+    }
+    await loadTree()
+    await openNote(item.path)
+    setToast({ text: `「${nameOf(item.path)}」を元の場所に戻しました` })
+    return null
   }
 
   const toggleFolder = (path: string) => setOpenFolders((prev) => {
@@ -471,11 +529,12 @@ export default function App() {
                   {sortNotes(filtered, sort).map((n) => <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''}`} onClick={() => openNote(n.path)} title={n.path}><span>{n.name}</span><small>{folderOf(n.path)}</small></button>)}
                   <button className="note-item more" onClick={() => { setSwitcher(filter); setFilter('') }}><Search size={14} /><span>本文からも探す(Enter)</span></button>
                 </>
-              : <Tree node={tree} open={openFolders} toggle={toggleFolder} active={active} onOpen={(p) => void openNote(p)} sort={sort} />}
+              : <Tree node={tree} open={openFolders} toggle={toggleFolder} active={active} onOpen={(p) => void openNote(p)} onContext={(path, x, y) => setCtx({ path, x, y })} sort={sort} />}
             {apiOk === false && !notes.length && <div className="empty-list">サーバーにつながりません</div>}
             {apiOk && !notes.length && <div className="empty-list">ノートがありません</div>}
           </div>
           </>}
+          <button className="trash-link" onClick={() => setTrashOpen(true)}><Trash2 size={14} /> 整理待ち(消したノート)</button>
         </aside>}
 
         <main className="main-area">
@@ -570,6 +629,24 @@ export default function App() {
       {switcher !== null && <QuickSwitcher notes={notes} initial={switcher} onClose={() => setSwitcher(null)} onOpen={(p) => { setSwitcher(null); void openNote(p) }} onCreate={(name) => openNewNote(name)} />}
       {newNote && <NewNoteDialog folders={folders} defaultFolder={newNote.folder} defaultName={newNote.name} onClose={() => setNewNote(null)} onCreate={(f, n, kind, day, tags) => createNote(f, n, newNoteContent(kind, { day, tags }))} />}
       {diff && <DiffDialog mine={diff.mine} server={diff.server} onClose={() => setDiff(null)} />}
+      {ctx && <Dropdown at={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)} items={[
+        { label: '開く', onClick: () => void openNote(ctx.path) },
+        { label: 'パスをコピー', onClick: async () => { try { await navigator.clipboard.writeText(ctx.path); setToast({ text: 'パスをコピーしました' }) } catch { window.prompt('パス', ctx.path) } } },
+        'sep',
+        { label: '整理待ちへ移す(消す)…', danger: true, onClick: () => askDelete(ctx.path) },
+      ]} />}
+      {del && <DeleteDialog
+        path={del}
+        name={nameOf(del)}
+        unsaved={engine.get(del).status !== 'saved'}
+        busy={delBusy}
+        links={delLinks}
+        onSaveNow={() => engine.saveNow(del)}
+        onConfirm={() => void confirmDelete()}
+        onClose={() => !delBusy && setDel(null)}
+      />}
+      {trashOpen && <TrashDialog onClose={() => setTrashOpen(false)} onRestore={async (it) => { const err = await restoreNote(it); if (!err) setTrashOpen(false); return err }} />}
+      {toast && <Toast text={toast.text} action={toast.action} onAction={toast.onAction} onClose={() => setToast(null)} />}
     </div>
   )
 }

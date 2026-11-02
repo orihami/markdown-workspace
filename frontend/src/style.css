@@ -280,3 +280,38 @@ button { font: inherit; }
   .modal-backdrop { padding-top: 6vh; }
   .document-title { margin-bottom: 12px; }
 }
+
+/* ---- めものきまり: 並べ替え・タスク・プロパティ ---- */
+.sort-box { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 700; color: var(--muted); padding: 0 8px 8px; }
+.sort-box select { flex: 1; max-width: 160px; border: 1px solid var(--line-2); border-radius: 8px; padding: 5px 6px; font: inherit; font-weight: 500; font-size: 12.5px; color: var(--ink); background: #fff; }
+.note-item small.late { color: var(--bad); font-weight: 700; }
+.note-item small.today { color: var(--accent-ink); font-weight: 700; }
+.note-item.done span { color: var(--muted); text-decoration: line-through; text-decoration-color: #bbb; }
+.note-item.task .file-icon { color: var(--accent); }
+.props { border: 1px solid var(--line); border-radius: 12px; background: #fbfaff; padding: 8px 12px; margin-bottom: 18px; display: flex; flex-direction: column; gap: 2px; }
+.props.warn { border-color: #f0cf94; background: #fff8ea; }
+.prop { display: flex; align-items: center; gap: 10px; min-height: 34px; font-size: 14px; }
+.prop-key { width: 84px; flex-shrink: 0; color: var(--muted); font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prop input[type="date"], .prop-text { font: inherit; font-size: 14px; border: 1px solid transparent; border-radius: 7px; padding: 4px 6px; background: transparent; color: var(--ink); min-width: 0; }
+.prop-text { flex: 1; }
+.prop input[type="date"]:hover, .prop-text:hover { border-color: var(--line-2); background: #fff; }
+.prop input[type="date"]:focus, .prop-text:focus { outline: 0; border-color: var(--accent); background: #fff; }
+.prop input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
+.prop-ro { color: var(--ink-2); font-size: 13px; }
+.prop-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; flex: 1; }
+.prop-tags .tag-chip { cursor: default; }
+.prop-tags .tag-chip button { border: 0; background: transparent; color: var(--muted); cursor: pointer; padding: 0 0 0 2px; font-size: 13px; }
+.tag-input { border: 1px dashed var(--line-2); border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 12.5px; width: 90px; background: transparent; }
+.tag-input:focus { outline: 0; border-color: var(--accent); background: #fff; width: 140px; }
+.prop-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; padding-top: 4px; }
+.prop-actions:empty { display: none; }
+.prop-actions .btn.tiny { margin-left: 0; }
+.prop-warn { color: #7a4f0e; font-size: 13px; font-weight: 700; }
+.seg { display: flex; gap: 2px; padding: 3px; background: var(--side); border: 1px solid var(--line); border-radius: 10px; }
+.seg button { flex: 1; border: 0; background: transparent; padding: 7px; border-radius: 8px; font-size: 14px; font-weight: 600; color: var(--ink-2); cursor: pointer; }
+.seg button.on { background: #fff; color: var(--accent-ink); box-shadow: 0 1px 3px rgba(30, 20, 70, 0.15); }
+.field-note { margin: 0; font-size: 12px; color: var(--muted); background: var(--side); border-radius: 8px; padding: 7px 9px; font-family: 'SFMono-Regular', Consolas, monospace; }
+@media (max-width: 760px) { .prop-key { width: 64px; } }
+/* 一覧: 名前は1行で省略し、日付は切らない */
+.note-item > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.note-item > small { flex-shrink: 0; max-width: none; margin-left: 4px; }

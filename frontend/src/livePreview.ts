@@ -6,7 +6,7 @@
 //   source  : 記号はそのまま。リンクだけ Ctrl(⌘)+クリックで開けるようにする
 // リンクを押すと onLink が呼ばれる(URL は新しいタブ、[[内部リンク]] はそのノートを開く)
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate, WidgetType } from '@codemirror/view'
-import { Range, Text } from '@codemirror/state'
+import { EditorState, Range, StateField, Text } from '@codemirror/state'
 import { syntaxTree } from '@codemirror/language'
 
 export type LiveMode = 'obsidian' | 'notion' | 'source'
@@ -82,7 +82,6 @@ function build(view: EditorView, mode: LiveMode): { all: DecorationSet; atomic: 
   }
   const codeLines = new Set<number>()
 
-  if (fmEnd) eachLine(0, fmEnd, 'cm-lp-fm')
   const look = (d: Range<Decoration>) => { if (!source) decos.push(d) }
 
   for (const { from, to } of view.visibleRanges) {
@@ -192,6 +191,28 @@ function build(view: EditorView, mode: LiveMode): { all: DecorationSet; atomic: 
   return { all: Decoration.set([...decos, ...atomic], true), atomic: Decoration.set(atomic, true) }
 }
 
+// Obsidian・Notion表示では、先頭のプロパティ(---〜---)はエディタに出さず、上の「プロパティ」の欄で編集する。
+// カーソルがプロパティの中に入って文字を打ち、YAML を壊さないよう、カーソルはプロパティのうしろへ寄せる
+const hideFront = StateField.define<DecorationSet>({
+  create: (s) => frontDeco(s),
+  update: (d, tr) => (tr.docChanged ? frontDeco(tr.state) : d),
+  provide: (f) => [EditorView.decorations.from(f), EditorView.atomicRanges.of((v) => v.state.field(f))],
+})
+function frontDeco(state: EditorState) {
+  const end = frontmatterEnd(state.doc)
+  return end ? Decoration.set([Decoration.replace({ block: true }).range(0, end)]) : Decoration.none
+}
+const keepCursorOutOfFront = EditorState.transactionFilter.of((tr) => {
+  if (!tr.selection) return tr
+  const end = frontmatterEnd(tr.newDoc)
+  if (!end) return tr
+  const after = Math.min(end + 1, tr.newDoc.length)
+  const sel = tr.selection
+  if (sel.ranges.every((r) => r.from >= after)) return tr
+  const fixed = sel.ranges.map((r) => (r.from < after ? { anchor: Math.max(r.anchor, after), head: Math.max(r.head, after) } : { anchor: r.anchor, head: r.head }))
+  return [tr, { selection: { anchor: fixed[0].anchor, head: fixed[0].head }, sequential: true }]
+})
+
 export function livePreview(mode: LiveMode, onLink: LinkHandler) {
   const plugin = ViewPlugin.fromClass(
     class {
@@ -227,5 +248,6 @@ export function livePreview(mode: LiveMode, onLink: LinkHandler) {
     },
   })
   // 隠した記号はカーソルで1文字ずつ通らない(まとめて飛ばす)
-  return [plugin, clicks, EditorView.atomicRanges.of((view) => view.plugin(plugin)?.atomic ?? Decoration.none)]
+  const front = mode === 'source' ? [] : [hideFront, keepCursorOutOfFront]
+  return [plugin, clicks, EditorView.atomicRanges.of((view) => view.plugin(plugin)?.atomic ?? Decoration.none), ...front]
 }

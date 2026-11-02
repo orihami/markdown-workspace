@@ -1,7 +1,8 @@
 // 画面の部品: フォルダの木・クイック検索・新しいノート・差分・メニュー
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronRight, FileText, Folder, FolderOpen, Search, X } from 'lucide-react'
+import { CheckSquare, ChevronRight, FileText, Folder, FolderOpen, Search, Square, X } from 'lucide-react'
 import { api, Note, SearchHit } from './api'
+import { MEMO_FOLDER, parseFront, SortName, sortNotes, tagLine, today } from './memo'
 
 // ---- フォルダの木 ----
 
@@ -41,14 +42,16 @@ export function folderList(notes: Note[]): string[] {
   return [...set].sort((a, b) => a.localeCompare(b, 'ja'))
 }
 
-export function Tree({ node, open, toggle, active, onOpen, depth = 0 }: {
+export function Tree({ node, open, toggle, active, onOpen, sort, depth = 0 }: {
   node: TreeNode
   open: Set<string>
   toggle: (path: string) => void
   active: string
   onOpen: (path: string) => void
+  sort: SortName
   depth?: number
 }) {
+  const day = today()
   return (
     <>
       {node.folders.map((f) => {
@@ -60,14 +63,17 @@ export function Tree({ node, open, toggle, active, onOpen, depth = 0 }: {
               {isOpen ? <FolderOpen size={15} /> : <Folder size={15} />}
               <span>{f.name}</span>
             </button>
-            {isOpen && <Tree node={f} open={open} toggle={toggle} active={active} onOpen={onOpen} depth={depth + 1} />}
+            {isOpen && <Tree node={f} open={open} toggle={toggle} active={active} onOpen={onOpen} sort={sort} depth={depth + 1} />}
           </div>
         )
       })}
-      {node.notes.map((n) => (
-        <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''}`} style={{ paddingLeft: 8 + depth * 14 + 16 }} onClick={() => onOpen(n.path)} title={n.path}>
-          <FileText size={15} className="file-icon" />
+      {sortNotes(node.notes, sort, day).map((n) => (
+        <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''} ${n.task ? 'task' : ''} ${n.done ? 'done' : ''}`} style={{ paddingLeft: 8 + depth * 14 + 16 }} onClick={() => onOpen(n.path)} title={`${n.path}${n.date ? `\ndate: ${n.date}` : ''}${n.task_day ? `\n遂行日: ${n.task_day}` : ''}`}>
+          {n.task ? (n.done ? <CheckSquare size={15} className="file-icon" /> : <Square size={15} className="file-icon" />) : <FileText size={15} className="file-icon" />}
           <span>{n.name}</span>
+          {sort.startsWith('遂行日') || sort === 'おすすめ'
+            ? n.task_day && <small className={!n.done && n.task_day < day ? 'late' : n.task_day === day ? 'today' : ''}>{n.task_day.slice(5).replace('-', '/')}</small>
+            : n.date && <small>{n.date.slice(0, 10).replace(/-/g, '/').slice(2)}</small>}
         </button>
       ))}
     </>
@@ -172,42 +178,55 @@ export function QuickSwitcher({ notes, initial, onOpen, onCreate, onClose }: {
   )
 }
 
-// ---- 新しいノート ----
+// ---- 新しいノート(メモ・タスク)。きまりどおりのプロパティを付けて作る ----
 
 export function NewNoteDialog({ folders, defaultFolder, defaultName, onCreate, onClose }: {
   folders: string[]
   defaultFolder: string
   defaultName: string
-  onCreate: (folder: string, name: string) => Promise<string | null>
+  onCreate: (folder: string, name: string, kind: 'memo' | 'task', day: string, tags: string[]) => Promise<string | null>
   onClose: () => void
 }) {
   const [name, setName] = useState(defaultName)
   const [folder, setFolder] = useState(defaultFolder)
+  const [kind, setKind] = useState<'memo' | 'task'>('memo')
+  const [day, setDay] = useState(today())
+  const [tags, setTags] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const bad = /[\\/:*?"<>|]/.test(name) || name.startsWith('.')
+  const tagList = tags.split(/[\s,、]+/).map((t) => t.replace(/^#/, '')).filter(Boolean)
+  const badTag = tagList.some((t) => /^\d+$/.test(t.replace(/\//g, '')))
   const submit = async () => {
-    if (!name.trim() || bad || busy) return
+    if (!name.trim() || bad || badTag || busy) return
     setBusy(true)
-    const err = await onCreate(folder, name.trim())
+    const err = await onCreate(folder, name.trim(), kind, day, tagList)
     setBusy(false)
     if (err) setError(err)
   }
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <form className="modal small" onMouseDown={(e) => e.stopPropagation()} onSubmit={(e) => { e.preventDefault(); void submit() }}>
-        <h2>新しいノート</h2>
-        <label className="field">名前<input autoFocus value={name} onChange={(e) => { setName(e.target.value); setError('') }} placeholder="ノートの名前" /></label>
+        <h2>新しく作る</h2>
+        <div className="seg" role="radiogroup" aria-label="種類">
+          <button type="button" className={kind === 'memo' ? 'on' : ''} onClick={() => setKind('memo')}>メモ</button>
+          <button type="button" className={kind === 'task' ? 'on' : ''} onClick={() => setKind('task')}>タスク</button>
+        </div>
+        <label className="field">名前<input autoFocus value={name} onChange={(e) => { setName(e.target.value); setError('') }} placeholder={kind === 'task' ? 'タスクの名前' : 'メモの名前'} /></label>
         {bad && <p className="field-error">\ / : * ? " &lt; &gt; | は使えません</p>}
+        {kind === 'task' && <label className="field">遂行日<input type="date" value={day} onChange={(e) => setDay(e.target.value)} required /></label>}
+        <label className="field">タグ(空白で区切る・なくてもよい)<input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="例: ものづくり 電子工作" /></label>
+        {badTag && <p className="field-error">数字だけのタグは使えません</p>}
         <label className="field">フォルダ
           <select value={folder} onChange={(e) => setFolder(e.target.value)}>
-            {folders.map((f) => <option key={f} value={f}>{f || '(いちばん上)'}</option>)}
+            {folders.map((f) => <option key={f} value={f}>{f || '(いちばん上)'}{f === MEMO_FOLDER ? '(ふだんはここ)' : ''}</option>)}
           </select>
         </label>
+        <p className="field-note">プロパティ: {kind === 'task' ? `遂行日: ${day} / 完了: false / ` : ''}date: '{today()}'{tagList.length ? ` ・タグ: ${tagList.map((t) => '#' + t).join(' ')}` : ''}</p>
         {error && <p className="field-error">{error}</p>}
         <div className="modal-actions">
           <button type="button" className="btn" onClick={onClose}>やめる</button>
-          <button type="submit" className="btn primary" disabled={!name.trim() || bad || busy}>作る</button>
+          <button type="submit" className="btn primary" disabled={!name.trim() || bad || badTag || busy}>作る</button>
         </div>
       </form>
     </div>
@@ -275,4 +294,99 @@ export function Dropdown({ items, onClose }: { items: MenuItem[]; onClose: () =>
         : <button key={k} role="menuitem" disabled={it.disabled} className={it.danger ? 'danger' : ''} onClick={() => { onClose(); it.onClick() }}>{it.label}</button>)}
     </div>
   )
+}
+
+// ---- プロパティの欄(Obsidian のプロパティ表示のように)。原文の該当する値だけを書きかえる ----
+
+export type TextChange = { from: number; to?: number; insert: string }
+
+export function PropsPanel({ text, memo, fileDate, onEdit }: {
+  text: string
+  memo: boolean // めもフォルダのノートか(date が必須)
+  fileDate: string
+  onEdit: (changes: TextChange[]) => void
+}) {
+  const fm = parseFront(text)
+  const tl = tagLine(text)
+  const [newTag, setNewTag] = useState('')
+  const eol = text.includes('\r\n') ? '\r\n' : '\n'
+  const props = fm?.props ?? []
+  const has = (k: string) => props.some((p) => p.key === k)
+  const setValue = (p: (typeof props)[number], v: string) => {
+    const q = p.quote || (/^\d{4}-\d{2}-\d{2}$/.test(v) && p.key === 'date' ? "'" : '')
+    onEdit([{ from: p.valueFrom, to: p.valueTo, insert: q + v + q }])
+  }
+  // プロパティを足す: 閉じ --- の前に。無ければ先頭に --- を作る(本文の前は空行1行)
+  const addProps = (lines: string[]) => {
+    if (fm) {
+      const closeStart = fm.to - fm.lines[fm.closeLine].replace(/\r$/, '').length
+      onEdit([{ from: closeStart, insert: lines.map((l) => l + eol).join('') }])
+    } else onEdit([{ from: 0, insert: `---${eol}${lines.map((l) => l + eol).join('')}---${eol}${text.startsWith('\n') || text.startsWith('\r\n') ? '' : eol}` }])
+  }
+  const makeTask = () => {
+    // タスクの並び(遂行日・完了・date)。date の前に入れる
+    const date = props.find((p) => p.key === 'date')
+    const add = [`遂行日: ${today()}`, '完了: false']
+    if (date && fm) {
+      const start = text.lastIndexOf('\n', date.valueFrom) + 1
+      onEdit([{ from: start, insert: add.map((l) => l + eol).join('') }])
+    } else addProps([...add, `date: '${today()}'`])
+  }
+  const writeTags = (tags: string[]) => {
+    const line = tags.map((t) => '#' + t).join(' ')
+    if (tl) onEdit([{ from: tl.from, to: tl.to, insert: line }])
+    else if (fm) {
+      // 閉じ --- → 空行 → タグ → 空行 → 本文(あいだの空行だけを整える)
+      const ws = text.slice(fm.to).match(/^(\r?\n)*/)![0]
+      const body = text.length > fm.to + ws.length
+      onEdit([{ from: fm.to, to: fm.to + ws.length, insert: eol + eol + line + eol + (body ? eol : '') }])
+    }
+    else onEdit([{ from: 0, insert: line + eol + eol }])
+  }
+  const addTag = () => {
+    const t = newTag.trim().replace(/^#/, '')
+    if (!t || /\s/.test(t) || /^\d+$/.test(t.replace(/\//g, ''))) return
+    const cur = tl?.tags ?? []
+    if (!cur.includes(t)) writeTags([...cur, t])
+    setNewTag('')
+  }
+  const missingDate = memo && !has('date')
+  return (
+    <div className={`props ${missingDate ? 'warn' : ''}`}>
+      {props.map((p) => (
+        <div className="prop" key={p.line}>
+          <span className="prop-key">{p.key}</span>
+          {p.complex
+            ? <span className="prop-ro" title="この値はソース表示で編集してください">{fm!.lines.slice(p.line + 1).filter((l, i, a) => /^\s/.test(l) && a.slice(0, i).every((x) => /^\s/.test(x))).map((l) => l.trim().replace(/^-\s*/, '')).join(', ') || '(ソースで編集)'}</span>
+            : p.key === '完了' || /^(true|false)$/i.test(p.value)
+              ? <input type="checkbox" checked={/^true$/i.test(p.value)} onChange={(e) => setValue(p, e.target.checked ? 'true' : 'false')} aria-label={p.key} />
+              : /^\d{4}-\d{2}-\d{2}$/.test(p.value) || p.key === 'date' || p.key === '遂行日'
+                ? <input type="date" value={/^\d{4}-\d{2}-\d{2}/.test(p.value) ? p.value.slice(0, 10) : ''} onChange={(e) => e.target.value && setValue(p, e.target.value)} aria-label={p.key} />
+                : <PropText value={p.value} onCommit={(v) => setValue(p, v)} />}
+        </div>
+      ))}
+      <div className="prop">
+        <span className="prop-key">タグ</span>
+        <span className="prop-tags">
+          {(tl?.tags ?? []).map((t) => <span key={t} className="tag-chip">#{t}<button onClick={() => writeTags(tl!.tags.filter((x) => x !== t))} aria-label={`#${t} を外す`}>×</button></span>)}
+          <input className="tag-input" value={newTag} onChange={(e) => setNewTag(e.target.value)} placeholder="+ タグ" onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { e.preventDefault(); addTag() } }} onBlur={addTag} />
+        </span>
+      </div>
+      <div className="prop-actions">
+        {missingDate && <>
+          <span className="prop-warn">めものきまり: date がありません</span>
+          <button className="btn tiny" onClick={() => addProps([`date: '${today()}'`])}>今日の日付で付ける</button>
+          {fileDate && fileDate !== today() && <button className="btn tiny" onClick={() => addProps([`date: '${fileDate}'`])}>ファイルの日付({fileDate})で付ける</button>}
+        </>}
+        {!missingDate && !has('date') && <button className="btn tiny" onClick={() => addProps([`date: '${today()}'`])}>+ date</button>}
+        {!has('遂行日') && !has('完了') && <button className="btn tiny" onClick={makeTask}>タスクにする</button>}
+      </div>
+    </div>
+  )
+}
+
+function PropText({ value, onCommit }: { value: string; onCommit: (v: string) => void }) {
+  const [v, setV] = useState(value)
+  useEffect(() => setV(value), [value])
+  return <input className="prop-text" value={v} onChange={(e) => setV(e.target.value)} onBlur={() => v !== value && onCommit(v)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) (e.target as HTMLInputElement).blur() }} />
 }

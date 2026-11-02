@@ -25,7 +25,18 @@ export async function api<T>(url: string, init: RequestInit = {}, timeoutMs = 12
   return body as T
 }
 
-export type Note = { path: string; name: string; modified_at?: string; size?: number }
+export type Note = {
+  path: string
+  name: string
+  modified_at?: string
+  size?: number
+  // Frontmatter から(並べ替え・タスクの表示用)
+  has_props?: boolean
+  date?: string | null
+  task?: boolean
+  task_day?: string | null
+  done?: boolean
+}
 export type NoteResponse = { path: string; content: string; etag: string; modified_at?: string }
 export type SearchHit = { path: string; name: string; snippet?: string | null }
 export type TagCount = { tag: string; count: number }

@@ -126,3 +126,13 @@ def test_search_by_tag(client, vault):
     (vault / "e.md").write_text("---\ntags:\n  - project\n---\n", encoding="utf-8")
     paths = [i["path"] for i in client.get("/api/search", params={"tag": "project"}).json()["items"]]
     assert paths == ["d.md", "e.md"]
+
+
+def test_tree_has_sort_props(client, vault):
+    (vault / "t.md").write_text("---\n遂行日: 2026-11-02\n完了: false\ndate: '2026-11-01'\n---\n", encoding="utf-8")
+    (vault / "n.md").write_text("ふつうの文\n", encoding="utf-8")
+    items = {i["path"]: i for i in client.get("/api/tree").json()["items"]}
+    assert items["t.md"]["date"] == "2026-11-01" and items["t.md"]["task_day"] == "2026-11-02"
+    assert items["t.md"]["done"] is False and items["t.md"]["task"] is True
+    assert items["n.md"]["has_props"] is False and "date" not in items["n.md"]
+    assert items["a.md"]["has_props"] is True

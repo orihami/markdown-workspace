@@ -8,7 +8,8 @@ import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode } from './livePreview'
 import { workspaceCompletions } from './completions'
-import { buildTree, DiffDialog, Dropdown, folderList, MenuItem, NewNoteDialog, QuickSwitcher, Tree } from './components'
+import { buildTree, DiffDialog, Dropdown, folderList, MenuItem, NewNoteDialog, PropsPanel, QuickSwitcher, TextChange, Tree } from './components'
+import { inMemoFolder, MEMO_FOLDER, newNoteContent, parseFront, SortName, SORTS } from './memo'
 
 // 表示(仕様 4.3)。どれも同じエディタで直接書き、ファイルの中身は変えない(見た目だけ)
 //   obsidian: ライブプレビュー(カーソルの行だけ記号が見える) / notion: 記号を隠し、改行で候補 / source: 記号をそのまま
@@ -72,6 +73,10 @@ export default function App() {
   const [diff, setDiff] = useState<{ mine: string; server: string } | null>(null)
   const [notice, setNotice] = useState('')
   const [vaultName, setVaultName] = useState(() => load('obsidian.vault', 'OMNI'))
+  // 並べ替え(OMNIメモアプリと同じ種類。めもの sortspec と同じ「日付が新しい順」が最初)
+  const [sort, setSort] = useState<SortName>(() => { const v = load('tree.sort', '日付が新しい順') as SortName; return SORTS.includes(v) ? v : '日付が新しい順' })
+  // プロパティの欄に出すための、ノートの先頭部分(プロパティとタグの行)
+  const [head, setHead] = useState('')
 
   const editorRef = useRef<ReactCodeMirrorRef>(null)
   const notesRef = useRef(notes)
@@ -82,6 +87,33 @@ export default function App() {
   activeRef.current = active
   const contentRef = useRef('')
   const openSeq = useRef(0)
+  const headOf = (text: string) => {
+    const fm = parseFront(text)
+    const start = fm ? fm.to : 0
+    // プロパティと、そのあとのタグの行まで(本文を打つたびに画面全体を描き直さないため)。
+    // 本文があるかどうかが分かるよう、もう1文字ふくめる
+    const m = text.slice(start).match(/^(\r?\n)*(#[^\n]*)?/)
+    return text.slice(0, start + (m ? m[0].length : 0) + 1)
+  }
+  const setText = (path: string, text: string) => {
+    contentRef.current = text
+    const h = headOf(text)
+    setHead((prev) => {
+      if (prev === h) return prev
+      // 一覧の印・並び(date・遂行日・完了)もすぐ合わせる
+      const props = parseFront(text)?.props ?? []
+      const get = (k: string) => props.find((p) => p.key === k)?.value
+      setNotes((list) => list.map((n) => n.path !== path ? n : {
+        ...n,
+        has_props: !!parseFront(text),
+        date: get('date') || null,
+        task_day: get('遂行日') || null,
+        done: /^true$/i.test(get('完了') || ''),
+        task: get('遂行日') !== undefined || get('完了') !== undefined,
+      }))
+      return h
+    })
+  }
 
   const sync = active ? engine.get(active) : null
   const tree = useMemo(() => buildTree(notes), [notes])
@@ -111,7 +143,7 @@ export default function App() {
       const { content, restored } = await engine.open(path, r.content, r.etag)
       if (seq !== openSeq.current) return
       setActive(path)
-      contentRef.current = content
+      setText(path, content)
       setDoc({ path, content, seq: Date.now() })
       setNotice(restored ? '送れていなかった変更を復元しました。つながりしだい送ります' : '')
       store('last.note', path)
@@ -133,7 +165,7 @@ export default function App() {
         const mine = await engine.mineContent(path)
         if (mine !== null) {
           setActive(path)
-          contentRef.current = mine
+          setText(path, mine)
           setDoc({ path, content: mine, seq: Date.now() })
           setNotice('サーバーにつながらないので、端末に残っている内容を開きました。書いた分はつながりしだい送ります')
         } else setNotice('サーバーにつながらないので、ノートを開けません')
@@ -169,11 +201,13 @@ export default function App() {
   }, [loadTree, loadTags, openNote])
 
   // ---- 新しいノート ----
+  // 新しいメモは ふだん「めも」に作る(Obsidian の設定と同じ)
   const openNewNote = useCallback((name = '', folder?: string) => {
     setSwitcher(null)
-    setNewNote({ folder: folder ?? folderOf(activeRef.current), name })
+    const memo = notesRef.current.some((n) => inMemoFolder(n.path))
+    setNewNote({ folder: folder ?? (memo ? MEMO_FOLDER : folderOf(activeRef.current)), name })
   }, [])
-  const createNote = async (folder: string, name: string, content = ''): Promise<string | null> => {
+  const createNote = async (folder: string, name: string, content: string): Promise<string | null> => {
     const path = `${folder ? folder + '/' : ''}${name}.md`
     try {
       await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content }) })
@@ -213,7 +247,7 @@ export default function App() {
     }
     const found = resolveNote(target)
     if (found) void openNote(found.path)
-    else openNewNote(target.split('/').pop() || target, folderOf(activeRef.current))
+    else openNewNote(target.split('/').pop() || target)
   }
 
   // ---- ブロックの候補(/ と、Notion表示の改行) ----
@@ -272,7 +306,7 @@ export default function App() {
       if (u.selectionSet && menuRef.current.open && u.state.doc.lineAt(u.state.selection.main.head).number !== menuLineRef.current) setShowCommands(false)
       return
     }
-    if (!u.transactions.some((t) => t.isUserEvent('input') && !t.isUserEvent('input.block'))) return
+    if (!u.transactions.some((t) => t.isUserEvent('input') && !t.isUserEvent('input.block') && !t.isUserEvent('input.props'))) return
     const head = u.state.selection.main.head
     const line = u.state.doc.lineAt(head)
     const before = u.state.doc.sliceString(line.from, head)
@@ -340,7 +374,7 @@ export default function App() {
     const err = await createNoteRaw(folderOf(active), copyName, mine)
     if (err) { setNotice(`自分の版を別名で保存できませんでした: ${err}。ノートはそのままです`); return }
     const server = await engine.useServer(active)
-    contentRef.current = server ?? ''
+    setText(active, server ?? '')
     setDoc({ path: active, content: server ?? '', seq: Date.now() })
     setNotice(`自分の版を「${copyName}」として保存し、このノートはサーバーの版にしました`)
     void loadTree()
@@ -363,10 +397,17 @@ export default function App() {
     { label: 'Markdown をダウンロード', onClick: () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([contentRef.current], { type: 'text/markdown' })); a.download = active.split('/').pop()!; a.click(); URL.revokeObjectURL(a.href) } },
     { label: 'サーバーから読み直す', onClick: () => void openNote(active, { push: false }) },
     'sep',
-    { label: 'このフォルダに新しいノート', onClick: () => openNewNote('', folderOf(active)) },
+    { label: 'このフォルダに新しく作る', onClick: () => openNewNote('', folderOf(active)) },
     'sep',
     ...PRESENTATIONS.map((p) => ({ label: `${presentation === p.id ? '✓ ' : '　'}${p.label}`, onClick: () => choosePresentation(p.id) })),
   ] : []
+
+  // プロパティの欄からの変更も、ふつうの入力と同じくエディタに書く(元に戻す・保存が同じ流れになる)
+  const editHead = (changes: TextChange[]) => {
+    const view = editorRef.current?.view
+    if (!view) return
+    view.dispatch({ changes, userEvent: 'input.props' })
+  }
 
   const toggleFolder = (path: string) => setOpenFolders((prev) => {
     const next = new Set(prev)
@@ -402,19 +443,24 @@ export default function App() {
       <div className="workspace">
         {sidebarOpen && isMobile() && <div className="drawer-backdrop" onClick={() => setSidebarOpen(false)} />}
         {sidebarOpen && <aside className="sidebar">
-          <button className="side-action" onClick={() => openNewNote()}><FilePlus2 size={16} />新しいノート</button>
+          <button className="side-action" onClick={() => openNewNote()}><FilePlus2 size={16} />新しいメモ・タスク</button>
           <div className="search-box">
             <Search size={15} />
             <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="名前でしぼりこむ" onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { setSwitcher(filter); setFilter('') } }} />
             {filter && <button className="icon-button tiny" onClick={() => setFilter('')} aria-label="消す"><X size={14} /></button>}
           </div>
+          <label className="sort-box">並べ替え
+            <select value={sort} onChange={(e) => { setSort(e.target.value as SortName); store('tree.sort', e.target.value) }}>
+              {SORTS.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </label>
           <div className="note-list">
             {filter.trim()
               ? <>
                   {filtered.map((n) => <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''}`} onClick={() => openNote(n.path)} title={n.path}><span>{n.name}</span><small>{folderOf(n.path)}</small></button>)}
                   <button className="note-item more" onClick={() => { setSwitcher(filter); setFilter('') }}><Search size={14} /><span>本文からも探す(Enter)</span></button>
                 </>
-              : <Tree node={tree} open={openFolders} toggle={toggleFolder} active={active} onOpen={(p) => void openNote(p)} />}
+              : <Tree node={tree} open={openFolders} toggle={toggleFolder} active={active} onOpen={(p) => void openNote(p)} sort={sort} />}
             {apiOk === false && !notes.length && <div className="empty-list">サーバーにつながりません</div>}
             {apiOk && !notes.length && <div className="empty-list">ノートがありません</div>}
           </div>
@@ -464,6 +510,12 @@ export default function App() {
                 <button className={presentation === 'notion' ? 'selected' : ''} onClick={() => choosePresentation('notion')}><Sparkles size={14} /> Notion</button>
                 <button className={presentation === 'source' ? 'selected' : ''} onClick={() => choosePresentation('source')}><Command size={14} /> ソース</button>
               </div>
+              <PropsPanel
+                text={head}
+                memo={inMemoFolder(active)}
+                fileDate={(() => { const m = notes.find((n) => n.path === active)?.modified_at; return m ? new Date(m).toLocaleDateString('sv-SE') : '' })()}
+                onEdit={editHead}
+              />
               <div className={`editor-wrap mode-${presentation} ${loading ? 'loading' : ''}`} ref={wrapRef}>
                 <CodeMirror
                   key={doc.path + ':' + doc.seq}
@@ -473,7 +525,7 @@ export default function App() {
                   extensions={extensions}
                   theme="light"
                   basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: presentation === 'source', autocompletion: false, searchKeymap: true }}
-                  onChange={(v) => { contentRef.current = v; engine.edit(doc.path, v) }}
+                  onChange={(v) => { setText(doc.path, v); engine.edit(doc.path, v) }}
                   placeholder={presentation === 'notion' ? '書きはじめる…(改行すると見出し・リストなどを選べる)' : 'ここから書きはじめる…  / で見出しやリスト、[[ でノートへのリンク'}
                 />
                 {showCommands && <div className="command-menu" style={{ top: menuPos.top, left: menuPos.left }}>
@@ -488,7 +540,7 @@ export default function App() {
             <p>{loading ? '開いています…' : apiOk === false ? 'サーバーにつながりません。つながると一覧が出ます。' : '左の一覧からノートを選ぶか、探してください。'}</p>
             <div className="welcome-actions">
               <button className="btn primary" onClick={() => setSwitcher('')}><Search size={15} /> ノートを探す</button>
-              <button className="btn" onClick={() => openNewNote()}><FilePlus2 size={15} /> 新しいノート</button>
+              <button className="btn" onClick={() => openNewNote()}><FilePlus2 size={15} /> 新しいメモ・タスク</button>
             </div>
             {recent.length > 0 && <><h2>最近更新したノート</h2>
               <div className="recent">{recent.map((n) => <button key={n.path} onClick={() => openNote(n.path)}><b>{n.name}</b><small>{n.path}</small></button>)}</div></>}
@@ -511,7 +563,7 @@ export default function App() {
       </footer>
 
       {switcher !== null && <QuickSwitcher notes={notes} initial={switcher} onClose={() => setSwitcher(null)} onOpen={(p) => { setSwitcher(null); void openNote(p) }} onCreate={(name) => openNewNote(name)} />}
-      {newNote && <NewNoteDialog folders={folders} defaultFolder={newNote.folder} defaultName={newNote.name} onClose={() => setNewNote(null)} onCreate={(f, n) => createNote(f, n)} />}
+      {newNote && <NewNoteDialog folders={folders} defaultFolder={newNote.folder} defaultName={newNote.name} onClose={() => setNewNote(null)} onCreate={(f, n, kind, day, tags) => createNote(f, n, newNoteContent(kind, { day, tags }))} />}
       {diff && <DiffDialog mine={diff.mine} server={diff.server} onClose={() => setDiff(null)} />}
     </div>
   )

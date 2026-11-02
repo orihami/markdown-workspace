@@ -194,16 +194,17 @@ def tree():
                 continue
             rel = path.relative_to(root).as_posix()
             stat = path.stat()
-            items.append(
-                {
-                    "path": rel,
-                    "name": path.stem,
-                    "modified_at": datetime.fromtimestamp(
-                        stat.st_mtime, tz=timezone.utc
-                    ).isoformat(),
-                    "size": stat.st_size,
-                }
-            )
+            item = {
+                "path": rel,
+                "name": path.stem,
+                "modified_at": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).isoformat(),
+                "size": stat.st_size,
+            }
+            # 並べ替え・タスクの表示に使うプロパティ(date・遂行日・完了)。ファイルは変えない
+            item.update(sort_props(note_text(rel, path)))
+            items.append(item)
     except OSError as exc:
         raise HTTPException(status_code=503, detail=f"Vault read failed: {exc}") from exc
     items.sort(key=lambda item: item["path"].casefold())
@@ -355,6 +356,37 @@ def split_frontmatter(text: str) -> tuple[list[str], list[str]]:
             if lines[i].strip() in ("---", "..."):
                 return lines[1:i], lines[i + 1:]
     return [], lines
+
+
+def _scalar(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return value
+
+
+def sort_props(text: Optional[str]) -> dict:
+    """Frontmatter の date・遂行日・完了(めもの並べ替えと、タスクかどうかの判定に使う)"""
+    if text is None:
+        return {}
+    fm, _ = split_frontmatter(text)
+    out: dict = {"has_props": bool(fm) or text.lstrip("\ufeff").startswith("---")}
+    for i, line in enumerate(fm):
+        m = re.match(r"^(date|遂行日|完了)\s*:\s*(.*)$", line)
+        if not m:
+            continue
+        key, value = m.group(1), _scalar(m.group(2))
+        if not value and i + 1 < len(fm) and fm[i + 1].startswith((" ", "\t")):
+            value = _scalar(fm[i + 1])
+        if key == "date":
+            out["date"] = value or None
+        elif key == "遂行日":
+            out["task_day"] = value or None
+        else:
+            out["done"] = value.lower() == "true"
+    if "task_day" in out or "done" in out:
+        out["task"] = True
+    return out
 
 
 def tags_of(text: str) -> set[str]:

@@ -100,8 +100,9 @@ export function QuickSwitcher({ notes, initial, onOpen, onCreate, onClose }: {
   const local = useMemo(() => {
     if (tagQuery) return []
     const s = q.trim().toLowerCase()
-    if (!s) return [...notes].sort((a, b) => (b.modified_at || '').localeCompare(a.modified_at || '')).slice(0, 12).map((n) => ({ path: n.path, name: n.name, snippet: null as string | null }))
-    return notes.filter((n) => n.path.toLowerCase().includes(s)).slice(0, 30).map((n) => ({ path: n.path, name: n.name, snippet: null as string | null }))
+    // 並びは date の新しい順(ファイルの更新日時ではなく)
+    if (!s) return sortNotes(notes.filter((n) => n.date), '日付が新しい順').slice(0, 12).map((n) => ({ path: n.path, name: n.name, snippet: null as string | null }))
+    return sortNotes(notes.filter((n) => n.path.toLowerCase().includes(s)), '日付が新しい順').slice(0, 30).map((n) => ({ path: n.path, name: n.name, snippet: null as string | null }))
   }, [q, notes, tagQuery])
 
   useEffect(() => {
@@ -124,7 +125,11 @@ export function QuickSwitcher({ notes, initial, onOpen, onCreate, onClose }: {
   }, [q, tagQuery])
 
   const seen = new Set(local.map((l) => l.path))
-  const results = [...local, ...remote.filter((r) => !seen.has(r.path))]
+  const byPath = useMemo(() => new Map(notes.map((n) => [n.path, n])), [notes])
+  // 本文で見つかったものも date の新しい順に
+  const remoteSorted = sortNotes(remote.filter((r) => !seen.has(r.path)).map((r) => ({ ...(byPath.get(r.path) ?? { path: r.path, name: r.name }), snippet: r.snippet } as Note & { snippet?: string | null })), '日付が新しい順') as (Note & { snippet?: string | null })[]
+  const results = [...local, ...remoteSorted.map((r) => ({ path: r.path, name: r.name, snippet: r.snippet ?? null }))]
+  const dateOf = (path: string) => byPath.get(path)?.date?.slice(0, 10)
   const canCreate = !!q.trim() && !tagQuery && !notes.some((n) => n.name === q.trim())
   const total = results.length + (canCreate ? 1 : 0)
   useEffect(() => { setIndex(0) }, [q])
@@ -154,13 +159,13 @@ export function QuickSwitcher({ notes, initial, onOpen, onCreate, onClose }: {
           <button className="icon-button" onClick={onClose} aria-label="閉じる"><X size={16} /></button>
         </div>
         <div className="switcher-list">
-          {!q.trim() && <div className="switcher-section">最近更新したノート</div>}
+          {!q.trim() && <div className="switcher-section">新しいメモ(date の新しい順)</div>}
           {results.map((r, i) => (
             <button key={r.path} className={`switcher-item ${i === index ? 'selected' : ''}`} onMouseMove={() => setIndex(i)} onClick={() => choose(i)}>
               <FileText size={15} />
               <span className="switcher-main">
                 <b>{r.name}</b>
-                <small>{r.path}</small>
+                <small>{dateOf(r.path) ? `${dateOf(r.path)} · ` : ''}{r.path}</small>
                 {r.snippet && <em>{r.snippet}</em>}
               </span>
             </button>

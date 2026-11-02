@@ -173,6 +173,8 @@ try {
 
   // Ctrl+K で本文を探す
   await page.keyboard.press('Control+k')
+  await page.waitForSelector('.switcher-item')
+  check((await page.locator('.switcher-item b').first().textContent()) === '新しいメモ', 'Ctrl+K を開いたときの一覧は date の新しい順(ファイルの更新日時ではない)')
   await page.fill('.switcher-input input', 'CRLF')
   await page.waitForSelector('.switcher-item em', { timeout: 5000 })
   check((await page.textContent('.switcher-item em')).includes('CRLF'), 'Ctrl+K: 本文から探せて、前後の文が出る')
@@ -180,11 +182,15 @@ try {
   await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'メモ')
 
   // タグ
-  await page.waitForSelector('.tag-chip:has-text("#test")')
-  await page.click('.tag-chip:has-text("#test")')
+  check(!(await page.isVisible('.tag-row')), 'タグはフォルダの一覧には出さない(切りかえ)')
+  await page.click('.side-tabs button:has-text("タグ")')
+  await page.waitForSelector('.tag-row:has-text("#test")')
+  check(!(await page.isVisible('.tree-folder')), 'タグの画面ではタグだけを広く出す')
+  await page.click('.tag-row:has-text("#test")')
   await page.waitForSelector('.switcher-item:has-text("はじめに")', { timeout: 5000 })
   check(true, 'タグを押すと、そのタグのノートが出る(Frontmatter のタグ)')
   await page.keyboard.press('Escape')
+  await page.click('.side-tabs button:has-text("フォルダ")')
 
   // CRLF のノートは CRLF のまま
   await page.click('.cm-content')

@@ -3,13 +3,13 @@ import CodeMirror, { ReactCodeMirrorRef } from '@uiw/react-codemirror'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorView, keymap } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
-import { AlertTriangle, BookOpen, Check, CircleDot, CloudOff, Command, FilePlus2, Hash, Loader2, Menu, MoreHorizontal, PenLine, Search, Settings2, Sparkles, Wifi, WifiOff, X } from 'lucide-react'
+import { AlertTriangle, BookOpen, Check, CircleDot, CloudOff, Command, FilePlus2, Folder, Hash, Loader2, Menu, MoreHorizontal, PenLine, Search, Settings2, Sparkles, Wifi, WifiOff, X } from 'lucide-react'
 import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode } from './livePreview'
 import { workspaceCompletions } from './completions'
 import { buildTree, DiffDialog, Dropdown, folderList, MenuItem, NewNoteDialog, PropsPanel, QuickSwitcher, TextChange, Tree } from './components'
-import { inMemoFolder, MEMO_FOLDER, newNoteContent, parseFront, SortName, SORTS } from './memo'
+import { inMemoFolder, MEMO_FOLDER, newNoteContent, parseFront, SortName, sortNotes, SORTS } from './memo'
 
 // 表示(仕様 4.3)。どれも同じエディタで直接書き、ファイルの中身は変えない(見た目だけ)
 //   obsidian: ライブプレビュー(カーソルの行だけ記号が見える) / notion: 記号を隠し、改行で候補 / source: 記号をそのまま
@@ -65,7 +65,8 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => !isMobile())
   const [filter, setFilter] = useState('')
   const [openFolders, setOpenFolders] = useState<Set<string>>(() => { try { return new Set(JSON.parse(load('tree.open', '[]'))) } catch { return new Set() } })
-  const [tagsOpen, setTagsOpen] = useState(() => load('tags.open', '1') === '1')
+  // 左の一覧は「フォルダ」と「タグ」を切りかえて、どちらかを広く出す(タグがフォルダを押しつぶさないように)
+  const [sideTab, setSideTab] = useState<'files' | 'tags'>(() => (load('side.tab', 'files') === 'tags' ? 'tags' : 'files'))
   const [switcher, setSwitcher] = useState<string | null>(null)
   const [newNote, setNewNote] = useState<{ folder: string; name: string } | null>(null)
   const [noteMenu, setNoteMenu] = useState(false)
@@ -421,7 +422,7 @@ export default function App() {
   }, [filter, notes])
   const pending = engine.pending()
   const connected = online && apiOk !== false
-  const recent = useMemo(() => [...notes].sort((a, b) => (b.modified_at || '').localeCompare(a.modified_at || '')).slice(0, 8), [notes])
+  const recent = useMemo(() => sortNotes(notes.filter((n) => n.date), '日付が新しい順').slice(0, 8), [notes])
   const statusMsg = sync && sync.message && sync.status !== 'saved' && sync.status !== 'conflict' ? sync.message : ''
 
   return (
@@ -446,9 +447,19 @@ export default function App() {
           <button className="side-action" onClick={() => openNewNote()}><FilePlus2 size={16} />新しいメモ・タスク</button>
           <div className="search-box">
             <Search size={15} />
-            <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="名前でしぼりこむ" onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) { setSwitcher(filter); setFilter('') } }} />
+            <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder={sideTab === 'tags' ? 'タグをしぼりこむ' : '名前でしぼりこむ'} onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing && sideTab === 'files') { setSwitcher(filter); setFilter('') } }} />
             {filter && <button className="icon-button tiny" onClick={() => setFilter('')} aria-label="消す"><X size={14} /></button>}
           </div>
+          <div className="seg side-tabs" role="tablist">
+            <button className={sideTab === 'files' ? 'on' : ''} onClick={() => { setSideTab('files'); store('side.tab', 'files') }} role="tab" aria-selected={sideTab === 'files'}><Folder size={14} /> フォルダ</button>
+            <button className={sideTab === 'tags' ? 'on' : ''} onClick={() => { setSideTab('tags'); store('side.tab', 'tags') }} role="tab" aria-selected={sideTab === 'tags'}><Hash size={14} /> タグ{tags.length ? ` ${tags.length}` : ''}</button>
+          </div>
+          {sideTab === 'tags' ? <div className="tag-list">
+            {tags.filter((t) => !filter.trim() || t.tag.toLowerCase().includes(filter.trim().toLowerCase())).map((t) => (
+              <button key={t.tag} className="tag-row" onClick={() => setSwitcher('#' + t.tag)}><span>#{t.tag}</span><small>{t.count}</small></button>
+            ))}
+            {!tags.length && <span className="empty-list">タグはまだありません</span>}
+          </div> : <>
           <label className="sort-box">並べ替え
             <select value={sort} onChange={(e) => { setSort(e.target.value as SortName); store('tree.sort', e.target.value) }}>
               {SORTS.map((s) => <option key={s} value={s}>{s}</option>)}
@@ -457,20 +468,14 @@ export default function App() {
           <div className="note-list">
             {filter.trim()
               ? <>
-                  {filtered.map((n) => <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''}`} onClick={() => openNote(n.path)} title={n.path}><span>{n.name}</span><small>{folderOf(n.path)}</small></button>)}
+                  {sortNotes(filtered, sort).map((n) => <button key={n.path} className={`note-item ${active === n.path ? 'active' : ''}`} onClick={() => openNote(n.path)} title={n.path}><span>{n.name}</span><small>{folderOf(n.path)}</small></button>)}
                   <button className="note-item more" onClick={() => { setSwitcher(filter); setFilter('') }}><Search size={14} /><span>本文からも探す(Enter)</span></button>
                 </>
               : <Tree node={tree} open={openFolders} toggle={toggleFolder} active={active} onOpen={(p) => void openNote(p)} sort={sort} />}
             {apiOk === false && !notes.length && <div className="empty-list">サーバーにつながりません</div>}
             {apiOk && !notes.length && <div className="empty-list">ノートがありません</div>}
           </div>
-          <div className="sidebar-bottom">
-            <button className="section-toggle" onClick={() => { setTagsOpen((v) => !v); store('tags.open', tagsOpen ? '0' : '1') }}><Hash size={13} />タグ {tags.length ? `(${tags.length})` : ''}</button>
-            {tagsOpen && <div className="tag-cloud">
-              {tags.slice(0, 40).map((t) => <button key={t.tag} className="tag-chip" onClick={() => setSwitcher('#' + t.tag)}>#{t.tag}<small>{t.count}</small></button>)}
-              {!tags.length && <span className="empty-list">タグはまだありません</span>}
-            </div>}
-          </div>
+          </>}
         </aside>}
 
         <main className="main-area">
@@ -542,7 +547,7 @@ export default function App() {
               <button className="btn primary" onClick={() => setSwitcher('')}><Search size={15} /> ノートを探す</button>
               <button className="btn" onClick={() => openNewNote()}><FilePlus2 size={15} /> 新しいメモ・タスク</button>
             </div>
-            {recent.length > 0 && <><h2>最近更新したノート</h2>
+            {recent.length > 0 && <><h2>新しいメモ(date の新しい順)</h2>
               <div className="recent">{recent.map((n) => <button key={n.path} onClick={() => openNote(n.path)}><b>{n.name}</b><small>{n.path}</small></button>)}</div></>}
           </div>}
         </main>

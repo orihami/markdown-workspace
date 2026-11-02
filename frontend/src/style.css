@@ -315,3 +315,11 @@ button { font: inherit; }
 /* 一覧: 名前は1行で省略し、日付は切らない */
 .note-item > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .note-item > small { flex-shrink: 0; max-width: none; margin-left: 4px; }
+/* 左の一覧: フォルダとタグの切りかえ */
+.side-tabs { margin: 0 0 10px; }
+.side-tabs button { display: flex; align-items: center; justify-content: center; gap: 5px; font-size: 13px; padding: 6px; }
+.tag-list { flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 1px; padding-bottom: 8px; }
+.tag-row { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 10px; border: 0; background: transparent; border-radius: 7px; text-align: left; font-size: 14px; color: var(--accent-ink); cursor: pointer; }
+.tag-row:hover { background: var(--side-2); }
+.tag-row span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag-row small { color: var(--muted); font-size: 12px; background: #fff; border: 1px solid var(--line); border-radius: 999px; padding: 0 7px; }

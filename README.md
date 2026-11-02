@@ -9,53 +9,34 @@ NAS上のMarkdownを唯一の正本として扱う、個人用ブラウザMarkdo
 - `frontend/`: React + Vite。Notion寄りのUI、Markdown入力、プレビュー表示、入力候補、IndexedDBの下書き・保存キュー
 - `docker-compose.yml`: 開発・自宅サーバー向けの起動例
 
-## 大事な前提
+## 動かしている場所
 
-この作業環境からユーザー宅のNASやWindowsミニPCには接続できないため、実NASへの接続・既存Vaultの読み書き・実機での起動確認はまだ行っていません。最初は必ず既存Vaultのコピーをテスト用フォルダとして指定してください。
+サーバーは **ko-pi**（以前の仕様書でいう「常時稼働WindowsミニPC」と同じマシン。今は Debian）で動かしている。HDD が ko-pi に直接つながっているので、NAS 越しの遅さがない。
 
-## 起動方法（Windows）
+- systemd の `markdown-workspace.service` で常時起動。設定（Vault の場所・待ち受け先など）は `/etc/markdown-workspace/env`（リポジトリには入れない）
+- Tailscale のアドレスだけで待ち受けるので、Tailscale につながった PC・スマホから `http://ko-pi:<ポート>/` で開く。インターネットには出していない
+- 画面（frontend をビルドした `frontend/dist`）も API と同じポートで配る
+- **今は OMNI のコピー（SSD 上）を相手にしている**。本物の Vault に切り替えるのは、ユーザーが試して問題ないと確認してから
 
-1. Python 3.11以上、Node.js 20以上を用意
-2. `backend/.env.example` を `backend/.env` にコピーし、`VAULT_ROOT` をテスト用Markdownフォルダに変更
-3. APIを起動
+## 開発・テスト（ko-pi / Linux）
 
-```powershell
-cd backend
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```sh
+cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest httpx
+.venv/bin/python -m pytest -q tests          # パスの安全・競合・原子的保存・改行コード・権限
+cd ../frontend && npm ci && npm run build      # 画面をビルド(サービスはこの dist を配る)
+npm run e2e                                    # ブラウザで 入力→保存・API停止→再送・競合・CRLF を通しで確認
+sudo systemctl restart markdown-workspace      # 変更を反映
 ```
 
-4. 別のターミナルでフロントエンドを起動
-
-```powershell
-cd frontend
-npm install
-npm run dev -- --host 0.0.0.0
-```
-
-5. PCでは `http://localhost:5173`、スマートフォンでは同じLAN内のPCのIPアドレスとポート5173にアクセス
-
-開発時のViteプロキシは `/api` を `http://localhost:8000` に転送します。
-
-## NASパスの設定
-
-Windowsでは、可能ならドライブ文字よりUNCパスを推奨します。
-
-```env
-VAULT_ROOT=\\\\NAS名\\共有名\\Memo
-```
-
-`Z:` のような割り当てドライブは、APIをWindowsサービスとして起動した場合にサービスアカウントから見えないことがあります。ログインユーザーのターミナルから起動する場合は利用できることがあります。
+開発中は `npm run dev` で Vite を使ってもよい（`/api` は `http://127.0.0.1:8000` へ転送）。
 
 ## セキュリティ
 
-- LAN内だけで試してください。ルーターで8000/5173をインターネットへ公開しないでください。
-- 外出先から使う場合は、Tailscale等のプライベートネットワーク経由に限定してください。
+- インターネットへは公開しない（Tailscale 内だけ）。Tailscale Funnel などで外に出さない。
 - 本番公開前に認証、HTTPS、レート制限、CSRF/CORS、バックアップ、監査ログを整備してください。
 - `APP_TOKEN` を設定するとAPIのBearer認証が有効になります。フロントエンド側のトークン入力UIはまだ未実装です。
 
 ## 現時点の実装範囲
 
-これは実装の土台となるMVPです。Notionモードは現在「Markdown編集」と「レンダリング表示」の切り替えであり、Notionと同等の完全なブロックWYSIWYG編集ではありません。Markdownを壊さないことを優先して、まずソース編集とプレビューを確実に動かす構成にしています。次段階でMilkdown等を比較し、既存Markdownの往復変換テストを通してからWYSIWYG編集を追加します。
+ソース編集（CodeMirror）と、読みやすい表示（Notion表示）の切り替え。Notion表示は見るだけで、原文は変換しない。
+WYSIWYG 編集は仕様の Phase 3（Markdown の往復テストに合格してから）。

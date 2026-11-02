@@ -1,0 +1,105 @@
+import os
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app import main
+
+
+@pytest.fixture
+def vault(tmp_path, monkeypatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    (root / "a.md").write_text("---\ntags:\n  - x\n---\n# A\n[[B]] https://example.com\n", encoding="utf-8")
+    monkeypatch.setattr(main, "VAULT_ROOT", root)
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "state" / "db.sqlite3")
+    return root
+
+
+@pytest.fixture
+def client(vault):
+    return TestClient(main.app)
+
+
+def put(client, path, content, etag, mid=None):
+    return client.put(f"/api/notes/{path}", json={"content": content, "base_etag": etag, "mutation_id": mid or str(uuid.uuid4())})
+
+
+def test_read_keeps_content_and_etag(client, vault):
+    r = client.get("/api/notes/a.md")
+    assert r.status_code == 200
+    assert r.json()["content"] == (vault / "a.md").read_text(encoding="utf-8")
+    assert r.json()["etag"].startswith("sha256:")
+
+
+def test_save_then_conflict(client, vault):
+    etag = client.get("/api/notes/a.md").json()["etag"]
+    r = put(client, "a.md", "# new\n", etag)
+    assert r.status_code == 200
+    assert (vault / "a.md").read_text(encoding="utf-8") == "# new\n"
+    # 古い ETag のままもう一度 → 409、ファイルは変わらない
+    r = put(client, "a.md", "# stale\n", etag)
+    assert r.status_code == 409
+    assert r.json()["server_content"] == "# new\n"
+    assert (vault / "a.md").read_text(encoding="utf-8") == "# new\n"
+
+
+def test_base_etag_required(client):
+    r = client.put("/api/notes/a.md", json={"content": "x", "mutation_id": str(uuid.uuid4())})
+    assert r.status_code == 422
+
+
+def test_same_mutation_is_not_applied_twice(client, vault):
+    etag = client.get("/api/notes/a.md").json()["etag"]
+    mid = str(uuid.uuid4())
+    assert put(client, "a.md", "# one\n", etag, mid).status_code == 200
+    r = put(client, "a.md", "# one\n", etag, mid)
+    assert r.status_code == 200 and r.json()["duplicate"] is True
+
+
+@pytest.mark.parametrize("bad", ["../x.md", "..%2Fx.md", "/etc/passwd.md", "a/../../x.md", "a.txt"])
+def test_path_traversal_rejected(client, bad):
+    r = client.get(f"/api/notes/{bad}")
+    assert r.status_code in (400, 404)
+
+
+def test_symlink_escape_rejected(client, vault, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "s.md").write_text("secret", encoding="utf-8")
+    (vault / "link").symlink_to(outside)
+    assert client.get("/api/notes/link/s.md").status_code == 400
+    assert all(not i["path"].startswith("link/") for i in client.get("/api/tree").json()["items"])
+
+
+def test_missing_vault_fails_instead_of_creating(client, vault, monkeypatch, tmp_path):
+    gone = tmp_path / "unmounted" / "OMNI"
+    monkeypatch.setattr(main, "VAULT_ROOT", gone)
+    assert client.get("/api/health").status_code == 503
+    r = client.post("/api/notes", json={"path": "n.md", "content": "x"})
+    assert r.status_code == 503
+    assert not gone.exists()
+
+
+def test_crlf_and_permissions_kept(client, vault):
+    p = vault / "w.md"
+    p.write_bytes(b"# W\r\nline\r\n")
+    os.chmod(p, 0o644)
+    etag = client.get("/api/notes/w.md").json()["etag"]
+    assert put(client, "w.md", "# W\nline\nmore\n", etag).status_code == 200
+    assert p.read_bytes() == b"# W\r\nline\r\nmore\r\n"
+    assert (p.stat().st_mode & 0o777) == 0o644
+    assert not [x for x in os.listdir(vault) if x.startswith(".mw-")]
+
+
+def test_create_does_not_overwrite(client, vault):
+    assert client.post("/api/notes", json={"path": "new.md", "content": "1"}).status_code == 201
+    assert client.post("/api/notes", json={"path": "new.md", "content": "2"}).status_code == 409
+    assert (vault / "new.md").read_text(encoding="utf-8") == "1"
+
+
+def test_health_writes_nothing(client, vault):
+    before = sorted(os.listdir(vault))
+    assert client.get("/api/health").json()["ok"] is True
+    assert sorted(os.listdir(vault)) == before

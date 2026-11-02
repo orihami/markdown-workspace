@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import CodeMirror from '@uiw/react-codemirror'
 import { markdown } from '@codemirror/lang-markdown'
-import { oneDark } from '@codemirror/theme-one-dark'
+import { keymap } from '@codemirror/view'
+import { Prec } from '@codemirror/state'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { BookOpen, ChevronDown, FilePlus2, Folder, Hash, Menu, MoreHorizontal, Search, Settings2, Wifi, WifiOff, PanelLeftClose, Sparkles, Command } from 'lucide-react'
-import { enqueueSave, getDraft, listQueue, removeQueueItem, saveDraft } from './storage'
+import { enqueueSave, getDraft, listQueue, removeQueueUpTo, saveDraft } from './storage'
 
 type Note = { path: string; name: string; modified_at?: string; size?: number }
 type NoteResponse = { path: string; content: string; etag: string }
@@ -37,6 +38,8 @@ Obsidianの使いやすさと、Notionの見やすさを組み合わせる。
 / を入力するとコマンド候補が表示される
 \`\`\`
 `
+
+const notePath = (path: string) => '/api/notes/' + path.split('/').map(encodeURIComponent).join('/')
 
 const commands = [
   { label: '見出し 1', hint: '# ', icon: 'H1' },
@@ -75,6 +78,7 @@ export default function App() {
   const [online, setOnline] = useState(navigator.onLine)
   const [query, setQuery] = useState('')
   const [showCommands, setShowCommands] = useState(false)
+  const [commandIndex, setCommandIndex] = useState(0)
   const [showSettings, setShowSettings] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [apiReady, setApiReady] = useState(false)
@@ -88,6 +92,8 @@ export default function App() {
   const saveChainRef = useRef<Promise<void>>(Promise.resolve())
   const activePathRef = useRef(activePath)
   activePathRef.current = activePath
+  const retryingRef = useRef(false)
+  const retryDelayRef = useRef(2000)
 
   const filteredNotes = useMemo(() => notes.filter(n => `${n.name} ${n.path}`.toLowerCase().includes(query.toLowerCase())), [notes, query])
 
@@ -115,10 +121,14 @@ export default function App() {
 
   const openNote = useCallback(async (path: string) => {
     try {
-      const result = await api<NoteResponse>(`/api/notes/${encodeURIComponent(path).replaceAll('%2F', '/')}`)
+      const result = await api<NoteResponse>(notePath(path))
       const local = await getDraft(path)
       setActivePath(path)
-      const restoredContent = local && local.updatedAt > Date.now() - 1000 * 60 * 60 * 24 ? local.content : result.content
+      // スマホ幅では一覧が本文の上にかぶるので、ノートを開いたら閉じる
+      if (window.matchMedia('(max-width: 760px)').matches) setSidebarOpen(false)
+      // サーバーの保存確認がまだの下書きは、古くても必ず復元する(仕様 6.5)。
+      // 保存済みの下書きは使わない(ほかの端末・Obsidian での変更を古い内容で戻さないため)
+      const restoredContent = local && local.dirty !== false ? local.content : result.content
       const hasLocalChanges = restoredContent !== result.content
       // Preserve the draft's original server ETag. If the server changed while this
       // draft was offline, the next PUT must conflict instead of overwriting it.
@@ -128,9 +138,9 @@ export default function App() {
       etagsRef.current[path] = baseEtag
       skipNextSaveRef.current = !hasLocalChanges
       setContent(restoredContent)
-      setSaveState(local ? 'ローカル下書き' : '保存済み')
+      setSaveState(hasLocalChanges ? 'ローカル下書き' : '保存済み')
       setConflict(null)
-      if (local && local.content !== result.content) setNotice('未送信のローカル下書きを復元しました')
+      if (hasLocalChanges) setNotice('未送信のローカル下書きを復元しました')
       else setNotice('')
     } catch (error) {
       setNotice('ノートを開けませんでした。API接続を確認してください。')
@@ -139,8 +149,12 @@ export default function App() {
 
   useEffect(() => {
     if (!activePath) return
-    void saveDraft({ path: activePath, content, baseEtag: etagsRef.current[activePath] ?? etagRef.current, updatedAt: Date.now() })
-    if (skipNextSaveRef.current) { skipNextSaveRef.current = false; return }
+    if (skipNextSaveRef.current) {
+      skipNextSaveRef.current = false
+      void saveDraft({ path: activePath, content, baseEtag: etagsRef.current[activePath] ?? etagRef.current, updatedAt: Date.now(), dirty: false })
+      return
+    }
+    void saveDraft({ path: activePath, content, baseEtag: etagsRef.current[activePath] ?? etagRef.current, updatedAt: Date.now(), dirty: true })
     setSaveState('未保存')
     window.clearTimeout(timerRef.current)
     timerRef.current = window.setTimeout(() => {
@@ -153,21 +167,25 @@ export default function App() {
     if (!path) return
     const mutationId = crypto.randomUUID()
     const baseEtag = etagsRef.current[path] ?? etagRef.current
-    await enqueueSave({ id: mutationId, path, content: nextContent, baseEtag, createdAt: Date.now() })
+    const createdAt = Date.now()
+    await enqueueSave({ id: mutationId, path, content: nextContent, baseEtag, createdAt })
     if (!navigator.onLine) {
       setSaveState('オフライン・未保存')
       return
     }
     setSaveState('保存中')
     try {
-      const result = await api<{ etag: string }>('/api/notes/' + path.split('/').map(encodeURIComponent).join('/'), {
+      const result = await api<{ etag: string }>(notePath(path), {
         method: 'PUT',
         body: JSON.stringify({ content: nextContent, base_etag: baseEtag, mutation_id: mutationId }),
       })
-      await removeQueueItem(mutationId)
+      // これより古い送信待ちは、あとから送ると新しい内容を古い内容で戻してしまうので消す
+      await removeQueueUpTo(path, createdAt)
+      etagsRef.current[path] = result.etag
+      await markSaved(path, nextContent, result.etag)
+      if (activePathRef.current !== path) return
       setEtag(result.etag)
       etagRef.current = result.etag
-      etagsRef.current[path] = result.etag
       setSaveState('保存済み')
       setNotice('')
       void refreshTree()
@@ -176,39 +194,66 @@ export default function App() {
         setConflict(error.body)
         setSaveState('競合')
       } else {
-        setSaveState('未保存・再送待ち')
+        setSaveState(error.status ? `エラー(${error.status})・再送待ち` : '未保存・再送待ち')
       }
     }
   }
 
-  const retryQueue = useCallback(async () => {
-    if (!navigator.onLine) return
-    const queue = await listQueue()
-    const queueEtags: Record<string, string | null> = {}
-    for (const item of queue) {
-      try {
-        const result = await api<{ etag: string }>('/api/notes/' + item.path.split('/').map(encodeURIComponent).join('/'), {
-          method: 'PUT',
-          body: JSON.stringify({ content: item.content, base_etag: queueEtags[item.path] ?? etagsRef.current[item.path] ?? item.baseEtag, mutation_id: item.id }),
-        })
-        await removeQueueItem(item.id)
-        queueEtags[item.path] = result.etag
-        etagsRef.current[item.path] = result.etag
-        if (activePathRef.current === item.path) { setEtag(result.etag); etagRef.current = result.etag }
-      } catch (error: any) {
-        if (error.status === 409) {
-          setConflict(error.body)
-          setSaveState('競合')
-          break
-        }
-        break
-      }
-    }
-    if ((await listQueue()).length === 0) setSaveState('保存済み')
-  }, [])
+  // サーバーが保存を確認した内容は、下書きを「保存済み」にする(まだ入力が続いていれば dirty のまま)
+  const markSaved = async (path: string, savedContent: string, savedEtag: string) => {
+    const local = await getDraft(path)
+    if (!local || local.content === savedContent) await saveDraft({ path, content: savedContent, baseEtag: savedEtag, updatedAt: Date.now(), dirty: false })
+    else await saveDraft({ ...local, baseEtag: savedEtag })
+  }
 
+  // 送信待ちを再送する。ノートごとにいちばん新しい内容だけを送る(古い内容で上書きしないため)
+  const retryQueue = useCallback(async () => {
+    if (!navigator.onLine || retryingRef.current) return
+    retryingRef.current = true
+    try {
+      const queue = await listQueue()
+      const latest = new Map<string, (typeof queue)[number]>()
+      for (const item of queue) latest.set(item.path, item)
+      let failed = false
+      for (const item of latest.values()) {
+        try {
+          const result = await api<{ etag: string }>(notePath(item.path), {
+            method: 'PUT',
+            body: JSON.stringify({ content: item.content, base_etag: etagsRef.current[item.path] ?? item.baseEtag, mutation_id: item.id }),
+          })
+          await removeQueueUpTo(item.path, item.createdAt)
+          etagsRef.current[item.path] = result.etag
+          await markSaved(item.path, item.content, result.etag)
+          if (activePathRef.current === item.path) { setEtag(result.etag); etagRef.current = result.etag }
+        } catch (error: any) {
+          failed = true
+          if (error.status === 409 && activePathRef.current === item.path) {
+            setConflict(error.body)
+            setSaveState('競合')
+          }
+          if (!error.status) break
+        }
+      }
+      if (!failed) {
+        retryDelayRef.current = 2000
+        if (queue.length && (await listQueue()).length === 0) { setSaveState('保存済み'); void refreshTree() }
+      } else retryDelayRef.current = Math.min(retryDelayRef.current * 2, 60000)
+    } finally {
+      retryingRef.current = false
+    }
+  }, [refreshTree])
+
+  // 起動時・通信が戻ったとき、そのあとも送信待ちがあれば間隔をのばしながら再送する(仕様 6.1 の 7)
   useEffect(() => {
-    if (online) void retryQueue()
+    if (!online) return
+    let timer: number | undefined
+    const loop = async () => {
+      await retryQueue()
+      if (!(await listQueue()).length) retryDelayRef.current = 2000
+      timer = window.setTimeout(loop, retryDelayRef.current)
+    }
+    void loop()
+    return () => window.clearTimeout(timer)
   }, [online, retryQueue])
 
   const createNote = async () => {
@@ -222,6 +267,39 @@ export default function App() {
     } catch {
       setNotice('作成できませんでした。同名ノートがないか確認してください。')
     }
+  }
+
+  // 競合: 自分の下書きを同じフォルダに別名のノートとして保存する(どちらの内容も消さない)
+  const saveConflictCopy = async () => {
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[-:]/g, '').replace('T', '-')
+    const dir = activePath.includes('/') ? activePath.slice(0, activePath.lastIndexOf('/') + 1) : ''
+    const path = `${dir}${title} (競合 ${stamp}).md`
+    try {
+      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content }) })
+      await refreshTree()
+      setNotice(`自分の下書きを「${path}」として保存しました`)
+      loadServerVersion()
+    } catch {
+      const blob = new Blob([content], { type: 'text/markdown' })
+      const a = document.createElement('a')
+      a.href = URL.createObjectURL(blob)
+      a.download = `${title}-local-conflict.md`
+      a.click()
+      URL.revokeObjectURL(a.href)
+      setNotice('サーバーに別名保存できなかったので、下書きをファイルとしてダウンロードしました')
+    }
+  }
+
+  const loadServerVersion = () => {
+    if (!conflict) return
+    etagRef.current = conflict.server_etag
+    etagsRef.current[activePath] = conflict.server_etag
+    setEtag(conflict.server_etag)
+    skipNextSaveRef.current = true
+    setContent(conflict.server_content ?? content)
+    setConflict(null)
+    setSaveState('保存済み')
+    void removeQueueUpTo(activePath, Date.now())
   }
 
   const insertCommand = (hint: string) => {
@@ -245,7 +323,9 @@ export default function App() {
       const cursor = view.state.selection.main.head
       const line = view.state.doc.lineAt(cursor)
       const before = view.state.doc.sliceString(line.from, cursor)
-      setShowCommands(/(^|\\s)\\/$/.test(before))
+      const open = /(^|\s)\/$/.test(before)
+      if (open && !showCommands) setCommandIndex(0)
+      setShowCommands(open)
     }
   }
 
@@ -254,7 +334,18 @@ export default function App() {
     localStorage.setItem('presentation', value)
   }
 
-  const title = activePath ? activePath.split('/').pop()?.replace(/\\.md$/i, '') : 'ワークスペースのプレビュー'
+  const title = activePath ? activePath.split('/').pop()?.replace(/\.md$/i, '') : 'ワークスペースのプレビュー'
+
+  // / の候補はキーボードで選べる(↑↓で選択、Enter/Tabで確定、Escで閉じる)
+  const menuRef = useRef({ open: false, index: 0 })
+  menuRef.current = { open: showCommands, index: commandIndex }
+  const commandKeys = useMemo(() => Prec.highest(keymap.of([
+    { key: 'ArrowDown', run: () => { if (!menuRef.current.open) return false; setCommandIndex(i => (i + 1) % commands.length); return true } },
+    { key: 'ArrowUp', run: () => { if (!menuRef.current.open) return false; setCommandIndex(i => (i + commands.length - 1) % commands.length); return true } },
+    { key: 'Enter', run: () => { if (!menuRef.current.open) return false; insertCommand(commands[menuRef.current.index].hint); return true } },
+    { key: 'Tab', run: () => { if (!menuRef.current.open) return false; insertCommand(commands[menuRef.current.index].hint); return true } },
+    { key: 'Escape', run: () => { if (!menuRef.current.open) return false; setShowCommands(false); return true } },
+  ])), [])
   const saveLabel = saveState === '保存済み' ? '保存済み' : saveState
 
   return (
@@ -289,7 +380,7 @@ export default function App() {
           </div>
 
           {notice && <div className="notice">{notice}<button onClick={() => setNotice('')}>閉じる</button></div>}
-          {conflict && <div className="conflict-banner"><strong>このノートは別の場所で更新されています。</strong><span>上書きせず、サーバー版を確認するか、自分の下書きを別名保存してください。</span><div><button onClick={() => { setContent(conflict.server_content || content); setEtag(conflict.server_etag); setConflict(null); setSaveState('サーバー版を読み込み'); }}>サーバー版を読み込む</button><button onClick={() => { const blob = new Blob([content], { type: 'text/markdown' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${title}-local-conflict.md`; a.click(); URL.revokeObjectURL(a.href); }}>自分の下書きを保存</button></div></div>}
+          {conflict && <div className="conflict-banner"><strong>このノートは別の場所で更新されています。</strong><span>上書きせず、サーバー版を確認するか、自分の下書きを別名保存してください。</span><div><button onClick={saveConflictCopy}>自分の下書きを別名で保存</button><button onClick={() => { if (window.confirm('自分の下書きを捨てて、サーバー版を読み込みますか？')) loadServerVersion() }}>サーバー版を読み込む(下書きは捨てる)</button></div></div>}
 
           <article className="document">
             <div className="eyebrow">PERSONAL KNOWLEDGE BASE</div>
@@ -304,7 +395,7 @@ export default function App() {
                 ref={editorRef}
                 value={content}
                 height="calc(100vh - 300px)"
-                extensions={[markdown()]}
+                extensions={[markdown(), commandKeys]}
                 theme="light"
                 basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: true, autocompletion: true }}
                 onChange={handleEditorChange}
@@ -312,7 +403,7 @@ export default function App() {
               />
               {showCommands && <div className="command-menu">
                 <div className="command-heading">INSERT BLOCK <span>↑↓で選択 · Enterで挿入</span></div>
-                {commands.map((cmd, i) => <button key={cmd.label} onMouseDown={e => e.preventDefault()} onClick={() => insertCommand(cmd.hint)}><span className="command-icon">{cmd.icon}</span><span>{cmd.label}</span><small>{cmd.hint.replaceAll('\n', ' ↵ ')}</small></button>)}
+                {commands.map((cmd, i) => <button key={cmd.label} className={i === commandIndex ? 'selected' : ''} onMouseMove={() => setCommandIndex(i)} onMouseDown={e => e.preventDefault()} onClick={() => insertCommand(cmd.hint)}><span className="command-icon">{cmd.icon}</span><span>{cmd.label}</span><small>{cmd.hint.replaceAll('\n', ' ↵ ')}</small></button>)}
               </div>}
             </div> : <div className="rendered-document">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>

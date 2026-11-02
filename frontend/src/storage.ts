@@ -5,6 +5,8 @@ export type Draft = {
   content: string
   baseEtag: string | null
   updatedAt: number
+  // サーバーの保存確認がまだの変更があるか(false = サーバーと同じ内容)
+  dirty?: boolean
 }
 
 export type PendingSave = {
@@ -46,4 +48,11 @@ export async function listQueue() {
 export async function removeQueueItem(id: string) {
   const db = await dbPromise
   await db.delete('queue', id)
+}
+
+// あるノートの、指定した時刻までの送信待ちをまとめて消す(新しい内容が保存できたので古いものは不要)
+export async function removeQueueUpTo(path: string, createdAt: number) {
+  const db = await dbPromise
+  const items = await db.getAll('queue') as PendingSave[]
+  await Promise.all(items.filter(i => i.path === path && i.createdAt <= createdAt).map(i => db.delete('queue', i.id)))
 }

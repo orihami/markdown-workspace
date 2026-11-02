@@ -14,7 +14,7 @@ from uuid import UUID
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -28,6 +28,8 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 DB_PATH = Path(os.getenv("WORKSPACE_DB", "./workspace-state.sqlite3")).resolve()
+# ビルド済みのフロントエンド(frontend/dist)。あれば同じポートで配る
+FRONTEND_DIST = Path(os.getenv("FRONTEND_DIST", str(Path(__file__).resolve().parents[2] / "frontend" / "dist")))
 
 app = FastAPI(title="Markdown Workspace API", version="0.1.0")
 _path_locks: dict[str, threading.Lock] = {}
@@ -49,7 +51,8 @@ app.add_middleware(
 
 class SaveRequest(BaseModel):
     content: str
-    base_etag: Optional[str] = None
+    # 仕様 6.4: base_etag は必須(無いと競合を検出できず、他の端末の変更を上書きしてしまう)
+    base_etag: str = Field(min_length=1)
     mutation_id: UUID
 
 
@@ -67,11 +70,15 @@ def require_auth(authorization: Optional[str] = Header(default=None)) -> None:
 
 
 def ensure_root() -> Path:
+    # Vault のフォルダは作らない。NAS/HDD が外れているときにマウント先の空フォルダへ
+    # 書き込んで「保存済み」にしてしまわないよう、無ければ失敗させる(仕様 8: NAS切断時に成功を偽装しない)
     try:
-        VAULT_ROOT.mkdir(parents=True, exist_ok=True)
-        return VAULT_ROOT.resolve(strict=True)
+        root = VAULT_ROOT.resolve(strict=True)
     except OSError as exc:
-        raise HTTPException(status_code=503, detail=f"Vault unavailable: {exc}") from exc
+        raise HTTPException(status_code=503, detail="Vault unavailable") from exc
+    if not root.is_dir():
+        raise HTTPException(status_code=503, detail="Vault unavailable")
+    return root
 
 
 def safe_note_path(relative: str, must_exist: bool = False) -> Path:
@@ -127,10 +134,26 @@ def remember_mutation(mutation_id: str, path: str, etag: str, saved_at: str):
         conn.commit()
 
 
+def keep_newlines(original: bytes, payload: bytes) -> bytes:
+    # 仕様 5.1: 既存ファイルの改行コードを保つ。ブラウザのエディタは LF で返すので、
+    # 元が CRLF だけのファイルなら CRLF に戻す
+    if b"\r\n" in original and b"\n" not in original.replace(b"\r\n", b""):
+        return payload.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    return payload
+
+
 def atomic_write(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # mkstemp は 0600 で作るので、元のファイルの権限(なければ umask どおり)に合わせる
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
     fd, temp_name = tempfile.mkstemp(prefix=".mw-", suffix=".tmp", dir=str(path.parent))
     try:
+        os.fchmod(fd, mode)
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
             handle.flush()
@@ -148,9 +171,9 @@ def atomic_write(path: Path, payload: bytes) -> None:
 def health():
     try:
         root = ensure_root()
-        probe = root / ".markdown-workspace-write-test"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink(missing_ok=True)
+        # Vault にファイルを作らずに書き込めるかを見る(Obsidian などに一時ファイルが見えないように)
+        if not os.access(root, os.W_OK):
+            raise OSError("Vault is not writable")
         return {"ok": True, "vault_available": True, "vault_root_configured": True}
     except Exception as exc:
         return JSONResponse(
@@ -236,7 +259,7 @@ def put_note(note_path: str, body: SaveRequest):
             raise HTTPException(status_code=503, detail=f"Read failed: {exc}") from exc
 
         current_etag = etag_for(current)
-        if body.base_etag and body.base_etag != current_etag:
+        if body.base_etag != current_etag:
             try:
                 server_content = current.decode("utf-8")
             except UnicodeDecodeError:
@@ -250,6 +273,7 @@ def put_note(note_path: str, body: SaveRequest):
                 },
             )
 
+        payload = keep_newlines(current, payload)
         try:
             atomic_write(path, payload)
         except OSError as exc:
@@ -276,7 +300,11 @@ def create_note(body: CreateRequest):
     if len(payload) > MAX_NOTE_BYTES:
         raise HTTPException(status_code=413, detail="Note exceeds configured size limit")
     try:
-        atomic_write(path, payload)
+        # このサーバー内で同時に同名ノートを作っても上書きしないよう、ロックの中で確かめてから作る
+        with lock_for(path):
+            if path.exists():
+                raise HTTPException(status_code=409, detail="Note already exists")
+            atomic_write(path, payload)
     except OSError as exc:
         raise HTTPException(status_code=503, detail=f"Write failed: {exc}") from exc
     return {"ok": True, "path": body.path, "etag": etag_for(payload)}
@@ -296,6 +324,8 @@ def search(q: str = ""):
         if any(part.startswith(".") for part in Path(rel).parts):
             continue
         try:
+            if path.stat().st_size > MAX_NOTE_BYTES:
+                continue
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
@@ -304,3 +334,20 @@ def search(q: str = ""):
         if len(results) >= 100:
             break
     return {"items": results}
+
+
+# ---- フロントエンド(ビルド済み)を同じポートで配る ----
+
+@app.get("/{asset_path:path}", include_in_schema=False)
+def frontend(asset_path: str):
+    if asset_path.startswith("api/") or not FRONTEND_DIST.is_dir():
+        raise HTTPException(status_code=404, detail="Not found")
+    dist = FRONTEND_DIST.resolve()
+    target = (dist / asset_path).resolve()
+    try:
+        target.relative_to(dist)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Not found")
+    if asset_path and target.is_file():
+        return FileResponse(target)
+    return FileResponse(dist / "index.html", headers={"Cache-Control": "no-cache"})

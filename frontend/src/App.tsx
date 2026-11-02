@@ -1,16 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import CodeMirror from '@uiw/react-codemirror'
-import { markdown } from '@codemirror/lang-markdown'
-import { keymap } from '@codemirror/view'
+import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
+import { EditorView, keymap } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
-import { BookOpen, ChevronDown, FilePlus2, Folder, Hash, Menu, MoreHorizontal, Search, Settings2, Wifi, WifiOff, PanelLeftClose, Sparkles, Command } from 'lucide-react'
+import { livePreview } from './livePreview'
+import { BookOpen, ChevronDown, FilePlus2, FileText, Hash, Menu, MoreHorizontal, Search, Settings2, Wifi, WifiOff, Sparkles, Command, PenLine } from 'lucide-react'
 import { enqueueSave, getDraft, listQueue, removeQueueUpTo, saveDraft } from './storage'
 
 type Note = { path: string; name: string; modified_at?: string; size?: number }
 type NoteResponse = { path: string; content: string; etag: string }
-type Presentation = 'source' | 'notion'
+// source: Markdown をそのまま見て書く / obsidian: Obsidian のライブプレビュー(カーソルの行だけ記号が見える)
+// notion: 記号はいつも隠し、改行するたびにブロックの候補を出す。どれもファイルの中身は変えない(見た目だけ)
+type Presentation = 'source' | 'obsidian' | 'notion'
+const PRESENTATIONS: Presentation[] = ['obsidian', 'notion', 'source']
+const PRESENTATION_KEY = 'editor.presentation'
 
 const DEMO = `---
 tags:
@@ -42,6 +45,7 @@ Obsidianの使いやすさと、Notionの見やすさを組み合わせる。
 const notePath = (path: string) => '/api/notes/' + path.split('/').map(encodeURIComponent).join('/')
 
 const commands = [
+  { label: 'テキスト', hint: '', icon: 'T' },
   { label: '見出し 1', hint: '# ', icon: 'H1' },
   { label: '見出し 2', hint: '## ', icon: 'H2' },
   { label: '見出し 3', hint: '### ', icon: 'H3' },
@@ -73,12 +77,21 @@ export default function App() {
   const [activePath, setActivePath] = useState('')
   const [content, setContent] = useState(DEMO)
   const [etag, setEtag] = useState<string | null>(null)
-  const [presentation, setPresentation] = useState<Presentation>(() => (localStorage.getItem('presentation') as Presentation) || 'source')
+  const [presentation, setPresentation] = useState<Presentation>(() => {
+    const saved = localStorage.getItem(PRESENTATION_KEY) as Presentation
+    return PRESENTATIONS.includes(saved) ? saved : 'obsidian'
+  })
   const [saveState, setSaveState] = useState('デモ表示')
   const [online, setOnline] = useState(navigator.onLine)
   const [query, setQuery] = useState('')
   const [showCommands, setShowCommands] = useState(false)
   const [commandIndex, setCommandIndex] = useState(0)
+  // slash: / を打ったとき / block: Notion表示で改行したとき(何も選ばずに書きはじめてもよい)
+  const [menuKind, setMenuKind] = useState<'slash' | 'block'>('slash')
+  const [menuPos, setMenuPos] = useState({ top: 0, left: 0 })
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const menuLineRef = useRef(-1) // 候補を開いた行(ほかの行へ移ったら閉じる)
+  const enterRef = useRef(false) // いま Enter が押された(リストを抜けたときも候補を出すため)
   const [showSettings, setShowSettings] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [apiReady, setApiReady] = useState(false)
@@ -302,50 +315,105 @@ export default function App() {
     void removeQueueUpTo(activePath, Date.now())
   }
 
-  const insertCommand = (hint: string) => {
-    const view = editorRef.current?.view
+  // 候補を選んだとき: 今の行を見出し・リストなどにする(/ で開いたときはその / を消す)
+  const applyBlock = (hint: string) => {
+    const view: EditorView | undefined = editorRef.current?.view
     if (!view) return
-    const { from, to } = view.state.selection.main
-    const line = view.state.doc.lineAt(from)
-    const start = line.from
-    const prefix = view.state.doc.sliceString(start, from)
-    const slashAt = prefix.lastIndexOf('/')
-    const replaceFrom = slashAt >= 0 ? start + slashAt : from
-    view.dispatch({ changes: { from: replaceFrom, to, insert: hint }, selection: { anchor: replaceFrom + hint.length } })
+    const head = view.state.selection.main.head
+    const line = view.state.doc.lineAt(head)
+    let body = line.text
+    let at = head - line.from
+    if (menuRef.current.kind === 'slash') {
+      const slash = body.lastIndexOf('/', at - 1)
+      if (slash >= 0) { body = body.slice(0, slash) + body.slice(at); at = slash }
+    }
+    let insert: string
+    let cursor: number
+    if (hint === '' || (hint.endsWith(' ') && !hint.includes('\n'))) {
+      // 行の頭の記号(# - > 1. - [ ])を入れかえる
+      const old = body.match(/^(#{1,6} |[-*+] \[[ xX]\] |[-*+] |\d+\. |> )/)?.[0].length ?? 0
+      insert = hint + body.slice(old)
+      cursor = hint.length + Math.max(0, at - old)
+    } else if (hint === '---') {
+      insert = body ? body + '\n---\n' : '---\n'
+      cursor = insert.length
+    } else {
+      // コードブロック: 中の行にカーソルを置く
+      const before = body ? body + '\n' : ''
+      insert = before + hint
+      cursor = before.length + hint.indexOf('\n') + 1
+    }
+    view.dispatch({ changes: { from: line.from, to: line.to, insert }, selection: { anchor: line.from + cursor }, userEvent: 'input.block' })
     view.focus()
     setShowCommands(false)
   }
 
   const handleEditorChange = (value: string) => {
     setContent(value)
-    const view = editorRef.current?.view
-    if (view) {
-      const cursor = view.state.selection.main.head
-      const line = view.state.doc.lineAt(cursor)
-      const before = view.state.doc.sliceString(line.from, cursor)
-      const open = /(^|\s)\/$/.test(before)
-      if (open && !showCommands) setCommandIndex(0)
-      setShowCommands(open)
-    }
   }
+
+  // 入力のたびに、候補を出すかどうかを決める
+  const openMenu = (view: EditorView, kind: 'slash' | 'block') => {
+    const head = view.state.selection.main.head
+    const at = view.coordsAtPos(head)
+    const box = wrapRef.current?.getBoundingClientRect()
+    if (at && box) setMenuPos({ top: at.bottom - box.top + 6, left: Math.max(0, Math.min(at.left - box.left, box.width - 290)) })
+    menuLineRef.current = view.state.doc.lineAt(head).number
+    setMenuKind(kind)
+    setCommandIndex(kind === 'slash' ? 0 : -1)
+    setShowCommands(true)
+  }
+  const menuListener = useMemo(() => EditorView.updateListener.of((u) => {
+    if (!u.docChanged) {
+      if (u.selectionSet && menuRef.current.open && u.state.doc.lineAt(u.state.selection.main.head).number !== menuLineRef.current) setShowCommands(false)
+      return
+    }
+    if (!u.transactions.some(t => t.isUserEvent('input') && !t.isUserEvent('input.block'))) return
+    const state = u.state
+    const head = state.selection.main.head
+    const line = state.doc.lineAt(head)
+    const before = state.doc.sliceString(line.from, head)
+    const entered = enterRef.current
+    enterRef.current = false
+    if (/(^|\s)\/$/.test(before)) openMenu(u.view, 'slash')
+    else if (presentation === 'notion' && entered && line.text.trim() === '') openMenu(u.view, 'block')
+    else setShowCommands(false)
+  }), [presentation])
 
   const togglePresentation = (value: Presentation) => {
     setPresentation(value)
-    localStorage.setItem('presentation', value)
+    setShowCommands(false)
+    localStorage.setItem(PRESENTATION_KEY, value)
   }
 
   const title = activePath ? activePath.split('/').pop()?.replace(/\.md$/i, '') : 'ワークスペースのプレビュー'
 
-  // / の候補はキーボードで選べる(↑↓で選択、Enter/Tabで確定、Escで閉じる)
-  const menuRef = useRef({ open: false, index: 0 })
-  menuRef.current = { open: showCommands, index: commandIndex }
+  // 候補はキーボードで選べる(↑↓で選択、Enter/Tabで確定、Escで閉じる)。
+  // Notion表示で改行したときの候補は何も選んでいない状態で出るので、そのまま Enter や文字を打てば普通に書ける
+  const menuRef = useRef({ open: false, index: 0, kind: 'slash' as 'slash' | 'block' })
+  menuRef.current = { open: showCommands, index: commandIndex, kind: menuKind }
+  const pick = () => {
+    const { open, index } = menuRef.current
+    enterRef.current = true
+    if (!open) return false
+    if (index < 0) { setShowCommands(false); return false }
+    applyBlock(commands[index].hint)
+    return true
+  }
   const commandKeys = useMemo(() => Prec.highest(keymap.of([
     { key: 'ArrowDown', run: () => { if (!menuRef.current.open) return false; setCommandIndex(i => (i + 1) % commands.length); return true } },
-    { key: 'ArrowUp', run: () => { if (!menuRef.current.open) return false; setCommandIndex(i => (i + commands.length - 1) % commands.length); return true } },
-    { key: 'Enter', run: () => { if (!menuRef.current.open) return false; insertCommand(commands[menuRef.current.index].hint); return true } },
-    { key: 'Tab', run: () => { if (!menuRef.current.open) return false; insertCommand(commands[menuRef.current.index].hint); return true } },
+    { key: 'ArrowUp', run: () => { if (!menuRef.current.open) return false; setCommandIndex(i => (i <= 0 ? commands.length - 1 : i - 1)); return true } },
+    { key: 'Enter', run: () => pick() },
+    { key: 'Tab', run: () => pick() },
     { key: 'Escape', run: () => { if (!menuRef.current.open) return false; setShowCommands(false); return true } },
   ])), [])
+  const extensions = useMemo(() => [
+    markdown({ base: markdownLanguage }),
+    EditorView.lineWrapping,
+    commandKeys,
+    menuListener,
+    ...(presentation === 'source' ? [] : [livePreview(presentation)]),
+  ], [presentation, commandKeys, menuListener])
   const saveLabel = saveState === '保存済み' ? '保存済み' : saveState
 
   return (
@@ -386,36 +454,34 @@ export default function App() {
             <div className="eyebrow">PERSONAL KNOWLEDGE BASE</div>
             <h1 className="document-title">{title}</h1>
             <div className="meta-row"><span>Markdown</span><span>·</span><span>{activePath || 'デモコンテンツ'}</span></div>
-            <div className="mode-switch">
-              <button className={presentation === 'source' ? 'selected' : ''} onClick={() => togglePresentation('source')}><Command size={14}/> Markdown編集</button>
+            <div className="mode-switch" role="tablist" aria-label="表示">
+              <button className={presentation === 'obsidian' ? 'selected' : ''} onClick={() => togglePresentation('obsidian')}><PenLine size={14}/> Obsidian表示</button>
               <button className={presentation === 'notion' ? 'selected' : ''} onClick={() => togglePresentation('notion')}><Sparkles size={14}/> Notion表示</button>
+              <button className={presentation === 'source' ? 'selected' : ''} onClick={() => togglePresentation('source')}><Command size={14}/> ソース</button>
             </div>
-            {presentation === 'source' ? <div className="editor-wrap">
+            <div className={`editor-wrap mode-${presentation}`} ref={wrapRef}>
               <CodeMirror
                 ref={editorRef}
                 value={content}
-                height="calc(100vh - 300px)"
-                extensions={[markdown(), commandKeys]}
+                minHeight="50vh"
+                extensions={extensions}
                 theme="light"
-                basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: true, autocompletion: true }}
+                basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: presentation === 'source', autocompletion: false }}
                 onChange={handleEditorChange}
-                placeholder="ここから書き始める..."
+                placeholder={presentation === 'notion' ? '書きはじめる…(改行すると見出し・リストなどを選べる)' : 'ここから書き始める…'}
               />
-              {showCommands && <div className="command-menu">
-                <div className="command-heading">INSERT BLOCK <span>↑↓で選択 · Enterで挿入</span></div>
-                {commands.map((cmd, i) => <button key={cmd.label} className={i === commandIndex ? 'selected' : ''} onMouseMove={() => setCommandIndex(i)} onMouseDown={e => e.preventDefault()} onClick={() => insertCommand(cmd.hint)}><span className="command-icon">{cmd.icon}</span><span>{cmd.label}</span><small>{cmd.hint.replaceAll('\n', ' ↵ ')}</small></button>)}
+              {showCommands && <div className="command-menu" style={{ top: menuPos.top, left: menuPos.left }}>
+                <div className="command-heading">{menuKind === 'block' ? 'ブロックにする' : '挿入'} <span>↑↓で選択 · Enterで決定 · Escで閉じる</span></div>
+                {commands.map((cmd, i) => <button key={cmd.label} className={i === commandIndex ? 'selected' : ''} onMouseMove={() => setCommandIndex(i)} onMouseDown={e => e.preventDefault()} onClick={() => applyBlock(cmd.hint)}><span className="command-icon">{cmd.icon}</span><span>{cmd.label}</span><small>{cmd.hint ? cmd.hint.replaceAll('\n', ' ↵ ') : '記号なし'}</small></button>)}
               </div>}
-            </div> : <div className="rendered-document">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
-              <button className="edit-from-preview" onClick={() => togglePresentation('source')}>編集に戻る</button>
-            </div>}
+            </div>
           </article>
         </main>
       </div>
 
       {showSettings && <div className="settings-popover">
         <div className="settings-title">表示設定</div>
-        <div className="settings-row"><div><strong>編集時の表示</strong><small>Markdown記号を表示するか選択</small></div><select value={presentation} onChange={e => togglePresentation(e.target.value as Presentation)}><option value="source">Markdown編集</option><option value="notion">Notion表示</option></select></div>
+        <div className="settings-row"><div><strong>編集時の表示</strong><small>どれも書いたまま保存。見た目だけ変わる</small></div><select value={presentation} onChange={e => togglePresentation(e.target.value as Presentation)}><option value="obsidian">Obsidian表示</option><option value="notion">Notion表示</option><option value="source">ソース</option></select></div>
         <div className="settings-row"><div><strong>自動保存</strong><small>入力停止後 550ms</small></div><span className="setting-value">ON</span></div>
         <div className="settings-row"><div><strong>ローカル下書き</strong><small>IndexedDBに保持</small></div><span className="setting-value">ON</span></div>
       </div>}
@@ -425,5 +491,5 @@ export default function App() {
 }
 
 function FileIcon() {
-  return <span className="file-icon"><Folder size={14}/></span>
+  return <span className="file-icon"><FileText size={15}/></span>
 }

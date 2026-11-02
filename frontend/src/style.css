@@ -295,3 +295,55 @@ button { font: inherit; color: inherit; }
   .modal-backdrop { padding-top: 6vh; }
   .settings-popover { left: 12px; right: 12px; bottom: 60px; width: auto; }
 }
+
+/* ---- タイトル(書いても書かなくてもいい) ---- */
+input.document-title { width: 100%; border: 0; background: transparent; padding: 0; font-family: inherit; outline: 0; }
+input.document-title::placeholder { color: var(--line-2); }
+input.document-title.auto { color: var(--ink-2); }
+input.document-title:focus { color: var(--ink); }
+.draft-hint { font-size: 12px; color: var(--faint); padding: 0 6px; }
+.meta-date-ro { font-size: 13px; color: var(--faint); padding: 2px 4px; }
+
+/* ---- ホーム ---- */
+.home { max-width: 760px; margin: 0 auto; padding: 36px 40px 120px; }
+.home-date { margin: 0; font-size: 13px; color: var(--muted); font-weight: 500; }
+.home-hello { margin: 4px 0 22px; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; }
+.capture { background: #fff; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 6px 24px rgba(35, 33, 29, 0.06); padding: 6px 6px 8px; transition: box-shadow 0.15s, border-color 0.15s; }
+.capture:focus-within { border-color: var(--line-2); box-shadow: 0 10px 32px rgba(35, 33, 29, 0.1); }
+.capture textarea { display: block; width: 100%; min-height: 96px; border: 0; outline: 0; resize: vertical; font: inherit; font-size: 17px; line-height: 1.8; padding: 12px 14px 6px; color: var(--ink); background: transparent; }
+.capture textarea::placeholder { color: var(--faint); }
+.capture-bar { display: flex; align-items: center; gap: 10px; padding: 0 8px; }
+.capture-hint { flex: 1; font-size: 12px; color: var(--faint); }
+.chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); background: var(--paper); color: var(--ink-2); border-radius: 999px; padding: 5px 11px; font-size: 13px; cursor: pointer; }
+.chip:hover { border-color: var(--line-2); }
+.chip.on { background: var(--accent-soft); border-color: #eec4b2; color: var(--accent-ink); }
+.home-empty { color: var(--bad); font-size: 14px; }
+.home-sec { margin-top: 34px; }
+.home-sec h2 { font-size: 12px; font-weight: 700; color: var(--muted); margin: 0 0 8px; letter-spacing: 0.02em; }
+.task-list { display: flex; flex-direction: column; }
+.task-row { display: flex; align-items: center; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--line); }
+.task-row input { width: 18px; height: 18px; accent-color: var(--accent); flex-shrink: 0; cursor: pointer; }
+.task-row button { flex: 1; min-width: 0; text-align: left; border: 0; background: transparent; padding: 0; font-size: 15.5px; color: var(--ink); cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-row button:hover { color: var(--accent-ink); }
+.task-row small { font-size: 12px; color: var(--faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.task-row small.late { color: var(--bad); font-weight: 600; }
+.task-row small.today { color: var(--accent); font-weight: 600; }
+.task-row.done button { color: var(--faint); text-decoration: line-through; }
+.fav-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.card { display: flex; flex-direction: column; gap: 6px; text-align: left; border: 1px solid var(--line); background: #fff; border-radius: 14px; padding: 14px 16px; cursor: pointer; min-height: 104px; transition: border-color 0.12s, box-shadow 0.12s, transform 0.12s; }
+.card:hover { border-color: var(--line-2); box-shadow: 0 8px 24px rgba(35, 33, 29, 0.08); transform: translateY(-1px); }
+.card b { font-size: 15.5px; font-weight: 600; color: var(--ink); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.card p { margin: 0; font-size: 13px; line-height: 1.65; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.card-foot { margin-top: auto; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.card-foot small { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+.card-foot em { font-style: normal; font-size: 11.5px; color: var(--ink-2); background: var(--side); border-radius: 5px; padding: 0 5px; }
+.home-more { display: flex; gap: 8px; margin-top: 28px; }
+@media (max-width: 760px) {
+  .home { padding: 18px 16px 100px; }
+  .home-hello { font-size: 25px; margin-bottom: 16px; }
+  .cards { grid-template-columns: 1fr; }
+  .capture-hint { display: none; }
+  .card { min-height: 0; }
+}
+.capture-bar .btn { margin-left: auto; }

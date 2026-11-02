@@ -8,8 +8,9 @@ import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode } from './livePreview'
 import { workspaceCompletions } from './completions'
-import { buildTree, DeleteDialog, DiffDialog, Dropdown, folderList, MenuItem, NewNoteDialog, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree } from './components'
-import { inMemoFolder, makeTask, MEMO_FOLDER, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
+import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree } from './components'
+import { applyChanges, cleanName, inMemoFolder, makeTask, MEMO_FOLDER, nameFromBody, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
+import { uuid } from './uuid'
 
 // 表示(仕様 4.3)。どれも同じエディタで直接書き、ファイルの中身は変えない(見た目だけ)
 //   obsidian: ライブプレビュー(カーソルの行だけ記号が見える) / notion: 記号を隠し、改行で候補 / source: 記号をそのまま
@@ -65,7 +66,6 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(() => !isMobile())
   const [openFolders, setOpenFolders] = useState<Set<string>>(() => { try { return new Set(JSON.parse(load('tree.open', '[]'))) } catch { return new Set() } })
   const [switcher, setSwitcher] = useState<string | null>(null)
-  const [newNote, setNewNote] = useState<{ folder: string; name: string } | null>(null)
   const [noteMenu, setNoteMenu] = useState(false)
   const [settings, setSettings] = useState(false)
   const [diff, setDiff] = useState<{ mine: string; server: string } | null>(null)
@@ -96,6 +96,26 @@ export default function App() {
   activeRef.current = active
   const contentRef = useRef('')
   const openSeq = useRef(0)
+  // いま開いているノートの場所(下書きのあいだは '')。エディタの入力はここを見て送る
+  const docPathRef = useRef('')
+  // タイトルは書いてもいいし、書かなくてもいい。書かなければ本文の書き出しを名前にする
+  const [title, setTitle] = useState('')
+  const titleRef = useRef(title)
+  titleRef.current = title
+  // 下書き: まだファイルが無い新しいメモ(書きはじめたら めも に作る)
+  const [draft, setDraft] = useState<{ folder: string; kind: 'memo' | 'task' } | null>(null)
+  const draftRef = useRef(draft)
+  draftRef.current = draft
+  // 本文の書き出しから名前を付けている、作ったばかりのノート(タイトルを自分で書くまで、書き出しに名前を合わせる)
+  const [fresh, setFresh] = useState<string | null>(null)
+  const freshRef = useRef(fresh)
+  freshRef.current = fresh
+  const createTimer = useRef<ReturnType<typeof setTimeout>>()
+  const renameTimer = useRef<ReturnType<typeof setTimeout>>()
+  const creating = useRef(false)
+  // ホームのすぐ書く欄
+  const [capture, setCapture] = useState(() => load('capture.text', ''))
+  const [captureTask, setCaptureTask] = useState(false)
   const headOf = (text: string) => {
     const fm = parseFront(text)
     const start = fm ? fm.to : 0
@@ -126,7 +146,6 @@ export default function App() {
 
   const sync = active ? engine.get(active) : null
   const tree = useMemo(() => buildTree(notes), [notes])
-  const folders = useMemo(() => folderList(notes), [notes])
 
   // ---- サーバーから一覧・タグ ----
   const loadTree = useCallback(async () => {
@@ -146,7 +165,7 @@ export default function App() {
   }, [])
 
   // ---- ノートを開く ----
-  const openNote = useCallback(async (path: string, opts: { push?: boolean } = {}) => {
+  const openNote = useCallback(async (path: string, opts: { push?: boolean; quiet?: boolean } = {}) => {
     const seq = ++openSeq.current
     setLoading(true)
     setNoteMenu(false)
@@ -154,6 +173,10 @@ export default function App() {
       const r = await api<NoteResponse>(notePath(path))
       const { content, restored } = await engine.open(path, r.content, r.etag)
       if (seq !== openSeq.current) return
+      docPathRef.current = path
+      setDraft(null)
+      setFresh((f) => (f === path ? f : null))
+      setTitle(nameOf(path))
       setActive(path)
       setText(path, content)
       setDoc({ path, content, seq: Date.now() })
@@ -171,11 +194,15 @@ export default function App() {
     } catch (e) {
       if (seq !== openSeq.current) return
       const err = e as ApiError
-      if (err.status === 404) setNotice(`「${path}」は見つかりませんでした(移動・削除されたかもしれません)`)
+      // 起動時に前回のノートが無くなっていたときは、知らせずに忘れる
+      if (err.status === 404 && opts.quiet) store('last.note', '')
+      else if (err.status === 404) setNotice(`「${path}」は見つかりませんでした(移動・削除されたかもしれません)`)
       else if (err.network) {
         // サーバーに届かないときでも、端末に残した送信待ちがあればそれを開く
         const mine = await engine.mineContent(path)
         if (mine !== null) {
+          docPathRef.current = path
+          setTitle(nameOf(path))
           setActive(path)
           setText(path, mine)
           setDoc({ path, content: mine, seq: Date.now() })
@@ -187,14 +214,113 @@ export default function App() {
     }
   }, [])
 
+
+  // ---- 新しいメモ: 名前は聞かずに、すぐ本文を書く ----
+  const memoFolder = () => (notesRef.current.some((n) => inMemoFolder(n.path)) ? MEMO_FOLDER : '')
+  // 同じフォルダに同じ名前があれば「 2」「 3」…を付ける(self は名前を変えるノート自身)
+  const uniqueName = (folder: string, base: string, self = '') => {
+    const taken = new Set(notesRef.current.filter((n) => folderOf(n.path) === folder && n.path !== self).map((n) => n.name.toLowerCase()))
+    if (!taken.has(base.toLowerCase())) return base
+    for (let k = 2; ; k++) if (!taken.has(`${base} ${k}`.toLowerCase())) return `${base} ${k}`
+  }
+  const startDraft = useCallback((folder?: string, kind: 'memo' | 'task' = 'memo', restore?: { body: string; title: string }) => {
+    setSwitcher(null)
+    setNoteMenu(false)
+    openSeq.current++
+    docPathRef.current = ''
+    setDraft({ folder: folder ?? memoFolder(), kind })
+    setActive('')
+    setFresh(null)
+    setTitle(restore?.title ?? '')
+    setHead('')
+    contentRef.current = restore?.body ?? ''
+    setDoc({ path: '', content: restore?.body ?? '', seq: Date.now() })
+    if (hashPath()) history.pushState(null, '', '#/')
+    if (isMobile()) setSidebarOpen(false)
+  }, [])
+  // 名前を指定して作る([[まだ無いノート]] や、探す画面の「新しく作る」)
+  const createNamed = async (name: string, folder = memoFolder(), body = '') => {
+    const n = uniqueName(folder, cleanName(name) || nameFromBody(body))
+    const path = `${folder ? folder + '/' : ''}${n}.md`
+    try {
+      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content: newNoteContent('memo') + body }) })
+    } catch (e) {
+      setToast({ text: `作れませんでした: ${(e as ApiError).message}` })
+      return null
+    }
+    await loadTree()
+    return path
+  }
+  const openNewNote = useCallback((name = '', folder?: string) => {
+    if (!name) { startDraft(folder); return }
+    setSwitcher(null)
+    void createNamed(name, folder).then((p) => { if (p) void openNote(p) })
+  }, [startDraft, openNote])
+
+  // 下書き → ファイルにする(入力が止まって 0.7秒。サーバーに届かなければ、書いた分は端末に残して次の入力でまた試す)
+  const createFromDraft = async () => {
+    const d = draftRef.current
+    if (!d || creating.current) return
+    const body = contentRef.current
+    const t = cleanName(titleRef.current)
+    if (!body.trim() && !t) return
+    creating.current = true
+    try {
+      const header = newNoteContent(d.kind, { day: today() })
+      const base = t || nameFromBody(body)
+      let path = ''
+      let etag = ''
+      for (let k = 0; k < 6 && !path; k++) {
+        const p = `${d.folder ? d.folder + '/' : ''}${uniqueName(d.folder, k ? `${base} ${k + 1}` : base)}.md`
+        try {
+          etag = (await api<{ etag: string }>('/api/notes', { method: 'POST', body: JSON.stringify({ path: p, content: header + body }) })).etag
+          path = p
+        } catch (e) {
+          if ((e as ApiError).status !== 409) throw e
+        }
+      }
+      if (!path) throw new Error('同じ名前のノートが多すぎます')
+      if (!draftRef.current) return
+      await engine.open(path, header + body, etag)
+      docPathRef.current = path
+      setDraft(null)
+      setActive(path)
+      setDoc((cur) => (cur ? { ...cur, path } : cur))
+      if (!t) setFresh(path)
+      setTitle(nameOf(path))
+      // エディタの先頭にもプロパティを入れる(見た目では隠れる)。作っている間に書いた分はこのあと送られる
+      editorRef.current?.view?.dispatch({ changes: { from: 0, insert: header }, userEvent: 'input.props' })
+      store('draft.new', '')
+      store('last.note', path)
+      history.replaceState(null, '', '#/' + encodeURI(path))
+      void loadTree()
+    } catch (e) {
+      const err = e as ApiError
+      setNotice(`まだ保存できていません: ${err.network ? 'サーバーにつながりません' : err.message}。書いた内容はこの端末に残っています`)
+    } finally {
+      creating.current = false
+    }
+  }
+
+  const createFromDraftRef = useRef(createFromDraft)
+  createFromDraftRef.current = createFromDraft
+
   // 起動: 送信待ちの再送・一覧・URL(#/パス)か前回のノートを開く
   useEffect(() => {
     void engine.start()
     void loadTree()
     void loadTags()
     void loadFavs()
-    const first = hashPath() || load('last.note', '')
-    if (first) void openNote(first, { push: !hashPath() })
+    // 起動したらホーム。URL にノートが入っているとき(再読み込み・共有)だけ、そのノートを開く
+    const first = hashPath()
+    // 作る前の書きかけが端末に残っていれば戻す(サーバーに届く前に閉じた・止まっていたとき)
+    let pendingDraft: { body: string; title: string; folder?: string; kind?: 'memo' | 'task' } | null = null
+    try { pendingDraft = JSON.parse(load('draft.new', '') || 'null') } catch { pendingDraft = null }
+    if (!hashPath() && pendingDraft && (pendingDraft.body.trim() || pendingDraft.title.trim())) {
+      startDraft(pendingDraft.folder, pendingDraft.kind || 'memo', pendingDraft)
+      setNotice('書きかけのメモを戻しました。つながりしだい めも に作ります')
+      setTimeout(() => void createFromDraftRef.current(), 1500)
+    } else if (first) void openNote(first, { push: false })
     const onHash = () => { const p = hashPath(); if (p && p !== activeRef.current) void openNote(p, { push: false }) }
     window.addEventListener('popstate', onHash)
     const up = () => setOnline(true)
@@ -211,27 +337,116 @@ export default function App() {
       window.removeEventListener('offline', down)
       clearInterval(health)
     }
-  }, [loadTree, loadTags, loadFavs, openNote])
+  }, [loadTree, loadTags, loadFavs, openNote, startDraft])
 
-  // ---- 新しいノート ----
-  // 新しいメモは ふだん「めも」に作る(Obsidian の設定と同じ)
-  const openNewNote = useCallback((name = '', folder?: string) => {
-    setSwitcher(null)
-    const memo = notesRef.current.some((n) => inMemoFolder(n.path))
-    setNewNote({ folder: folder ?? (memo ? MEMO_FOLDER : folderOf(activeRef.current)), name })
-  }, [])
-  const createNote = async (folder: string, name: string, content: string): Promise<string | null> => {
-    const path = `${folder ? folder + '/' : ''}${name}.md`
+  // 名前を変える(保存が終わってから。上書きはしない)
+  const renameTo = async (oldPath: string, newName: string, opts: { auto?: boolean } = {}) => {
+    const folder = folderOf(oldPath)
+    const newPath = `${folder ? folder + '/' : ''}${newName}.md`
+    if (newPath === oldPath) return true
+    const ok = await engine.settle(oldPath)
+    if (!ok || docPathRef.current !== oldPath) {
+      if (!opts.auto) setToast({ text: '保存が終わっていないので、名前はまだ変えられません' })
+      return false
+    }
+    const snapshot = contentRef.current
     try {
-      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content }) })
+      const r = await api<{ path: string; etag: string }>('/api/rename', { method: 'POST', body: JSON.stringify({ path: oldPath, new_path: newPath, base_etag: engine.baseOf(oldPath) ?? null }) })
+      engine.moved(oldPath, r.path, r.etag)
+      docPathRef.current = r.path
+      if (freshRef.current === oldPath) setFresh(r.path)
+      setActive(r.path)
+      setDoc((cur) => (cur ? { ...cur, path: r.path } : cur))
+      setTitle(nameOf(r.path))
+      history.replaceState(null, '', '#/' + encodeURI(r.path))
+      store('last.note', r.path)
+      setNotes((list) => list.map((n) => (n.path === oldPath ? { ...n, path: r.path, name: nameOf(r.path) } : n)))
+      setFavs((list) => list.map((f) => (f.path === oldPath ? { ...f, path: r.path } : f)))
+      // 名前を変えている間に書いた分は、新しい名前で送る
+      if (contentRef.current !== snapshot) engine.edit(r.path, contentRef.current)
+      return true
     } catch (e) {
       const err = e as ApiError
-      return err.status === 409 ? '同じ名前のノートがもうあります' : err.network ? 'サーバーにつながりません' : `作れませんでした: ${err.message}`
+      if (!opts.auto) setToast({ text: err.status === 409 ? (err.message.includes('同じ名前') ? '同じ名前のノートがもうあります' : 'ほかの場所で更新されています。開き直してください') : `名前を変えられませんでした: ${err.message}` })
+      return false
     }
-    setNewNote(null)
+  }
+  // 作ったばかりで名前を自分で書いていないノート: 書き出しが変われば名前も合わせる(まだどこからもリンクされていないので安全)
+  const autoRename = async () => {
+    const path = freshRef.current
+    if (!path || path !== docPathRef.current) return
+    const want = uniqueName(folderOf(path), nameFromBody(contentRef.current), path)
+    if (want && want !== nameOf(path)) await renameTo(path, want, { auto: true })
+  }
+  // タイトルを書いたとき(Enter か、欄から出たとき)
+  const commitTitle = async () => {
+    const path = docPathRef.current
+    const want = cleanName(titleRef.current)
+    if (!path) { if (want) { clearTimeout(createTimer.current); createTimer.current = setTimeout(() => void createFromDraft(), 300) } return }
+    if (!want) { setTitle(nameOf(path)); return }
+    if (want === nameOf(path)) { setFresh(null); return }
+    setFresh(null)
+    if (notesRef.current.some((n) => n.path !== path && folderOf(n.path) === folderOf(path) && n.name.toLowerCase() === want.toLowerCase())) {
+      setToast({ text: '同じ名前のノートがもうあります' })
+      setTitle(nameOf(path))
+      return
+    }
+    const links = (await api<{ items: { path: string }[] }>(`/api/search?q=${encodeURIComponent('[[' + nameOf(path))}&limit=200`).catch(() => ({ items: [] }))).items.filter((i) => i.path !== path).length
+    if (links && !window.confirm(`ほかの ${links} 件のノートから [[${nameOf(path)}]] でリンクされています。リンクは自動では直りません。名前を変えますか？`)) { setTitle(nameOf(path)); return }
+    if (!(await renameTo(path, want))) setTitle(nameOf(path))
+  }
+
+  // エディタの入力
+  const onEditorChange = (v: string) => {
+    const path = docPathRef.current
+    contentRef.current = v
+    if (!path) {
+      // 下書き: 端末にも残す(サーバーが止まっていても消えない)
+      store('draft.new', JSON.stringify({ body: v, title: titleRef.current, folder: draftRef.current?.folder, kind: draftRef.current?.kind }))
+      clearTimeout(createTimer.current)
+      createTimer.current = setTimeout(() => void createFromDraft(), 700)
+      return
+    }
+    setText(path, v)
+    engine.edit(path, v)
+    if (freshRef.current === path) {
+      clearTimeout(renameTimer.current)
+      renameTimer.current = setTimeout(() => void autoRename(), 1500)
+    }
+  }
+
+  // ホームのすぐ書く欄: 打った中身がそのままメモになる
+  const saveCapture = async () => {
+    const text = capture.trim()
+    if (!text) return
+    const folder = memoFolder()
+    const name = uniqueName(folder, nameFromBody(text))
+    const path = `${folder ? folder + '/' : ''}${name}.md`
+    try {
+      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content: newNoteContent(captureTask ? 'task' : 'memo', { day: today() }) + text + '\n' }) })
+    } catch (e) {
+      setToast({ text: `まだ残せていません: ${(e as ApiError).message}(書いた内容は欄に残っています)` })
+      return
+    }
+    setCapture('')
+    store('capture.text', '')
+    setCaptureTask(false)
     await loadTree()
-    await openNote(path)
-    return null
+    setToast({ text: `「${name}」を残しました`, action: '開く', onAction: () => void openNote(path) })
+  }
+
+  // ホームのタスク: 開かずにチェックして完了にする(そのノートを開いていればエディタから)
+  const setTaskDone = async (n: Note, done: boolean) => {
+    if (docPathRef.current === n.path) { editHead(setProp(contentRef.current, '完了', done ? 'true' : 'false')); return }
+    try {
+      const r = await api<NoteResponse>(notePath(n.path))
+      const next = applyChanges(r.content, setProp(r.content, '完了', done ? 'true' : 'false'))
+      await api(notePath(n.path), { method: 'PUT', body: JSON.stringify({ content: next, base_etag: r.etag, mutation_id: uuid() }) })
+      setNotes((list) => list.map((x) => (x.path === n.path ? { ...x, done } : x)))
+      if (done) setToast({ text: `「${n.name}」を完了にしました`, action: '元に戻す', onAction: () => void setTaskDone({ ...n, done: true }, false) })
+    } catch (e) {
+      setToast({ text: `変えられませんでした: ${(e as ApiError).message}` })
+    }
   }
 
   // ---- リンクを押したとき ----
@@ -494,7 +709,14 @@ export default function App() {
   })
   const pending = engine.pending()
   const connected = online && apiOk !== false
-  const recent = useMemo(() => sortNotes(notes.filter((n) => n.date), '日付が新しい順').slice(0, 8), [notes])
+  const recent = useMemo(() => sortNotes(notes.filter((n) => n.date && !n.task && (inMemoFolder(n.path) || !memoFolder())), '日付が新しい順').slice(0, 12), [notes])
+  const todayTasks = useMemo(() => notes.filter((n) => n.task && !n.done && n.task_day && n.task_day <= today()).sort((a, b) => a.task_day!.localeCompare(b.task_day!)), [notes])
+  const upcoming = useMemo(() => {
+    const week = new Date(); week.setDate(week.getDate() + 7)
+    const until = today(week)
+    return notes.filter((n) => n.task && !n.done && n.task_day && n.task_day > today() && n.task_day <= until).sort((a, b) => a.task_day!.localeCompare(b.task_day!))
+  }, [notes])
+  const greeting = () => { const h = new Date().getHours(); return h < 5 ? 'こんばんは' : h < 11 ? 'おはようございます' : h < 18 ? 'こんにちは' : 'こんばんは' }
   const statusMsg = sync && sync.message && sync.status !== 'saved' && sync.status !== 'conflict' ? sync.message : ''
 
   // 左の一覧: お気に入り → めも → (閉じた引き出し)ほかのフォルダ・タグ
@@ -579,14 +801,16 @@ export default function App() {
         <main className="main-area">
           <div className="topline">
             <button className="tool icon" onClick={() => setSidebarOpen((v) => !v)} aria-label="一覧を開く・閉じる"><Menu size={18} /></button>
-            {doc && <div className="breadcrumbs" title={active}>{folderOf(active).split('/').filter(Boolean).join(' / ')}</div>}
+            {doc && <div className="breadcrumbs" title={active}>{(draft ? draft.folder : folderOf(active)).split('/').filter(Boolean).join(' / ')}</div>}
             <div className="top-tools">
-              {doc && !isTask && <button className="tool" onClick={() => editHead(makeTask(contentRef.current))} title="遂行日・完了 を付けてタスクにする"><ListChecks size={15} /> タスクにする</button>}
+              {draft && <button className={`tool ${draft.kind === 'task' ? 'on' : ''}`} onClick={() => setDraft({ ...draft, kind: draft.kind === 'task' ? 'memo' : 'task' })} title="今日のタスクとして作る"><ListChecks size={15} /> {draft.kind === 'task' ? 'タスク(今日)' : 'タスクにする'}</button>}
+              {draft && <span className="draft-hint">書くと{draft.folder ? `「${draft.folder}」` : ''}に作ります</span>}
+              {doc && !draft && !isTask && <button className="tool" onClick={() => editHead(makeTask(contentRef.current))} title="遂行日・完了 を付けてタスクにする"><ListChecks size={15} /> タスクにする</button>}
               {sync && <button className={`save-indicator s-${sync.status}`} title={sync.message || STATUS_LABEL[sync.status]} onClick={() => engine.saveNow(active)} aria-live="polite">
                 {STATUS_ICON[sync.status]}<span>{STATUS_LABEL[sync.status]}</span>{pending > 1 && <em>+{pending - 1}</em>}
               </button>}
-              {doc && <button className={`tool icon ${isFav(active) ? 'on' : ''}`} onClick={() => void toggleFav(active, 'note')} aria-label={isFav(active) ? 'お気に入りから外す' : 'お気に入りにする'} title={isFav(active) ? 'お気に入りから外す' : 'お気に入りにする'}><Star size={17} /></button>}
-              {doc && <div className="menu-anchor">
+              {doc && !draft && <button className={`tool icon ${isFav(active) ? 'on' : ''}`} onClick={() => void toggleFav(active, 'note')} aria-label={isFav(active) ? 'お気に入りから外す' : 'お気に入りにする'} title={isFav(active) ? 'お気に入りから外す' : 'お気に入りにする'}><Star size={17} /></button>}
+              {doc && !draft && <div className="menu-anchor">
                 <button className="tool icon" onClick={() => setNoteMenu((v) => !v)} aria-label="ノートのメニュー" aria-expanded={noteMenu}><MoreHorizontal size={18} /></button>
                 {noteMenu && <Dropdown items={noteMenuItems} onClose={() => setNoteMenu(false)} />}
               </div>}
@@ -609,30 +833,44 @@ export default function App() {
             <article className="document">
               <div className="title-row">
                 {isTask && <input type="checkbox" className="title-check" checked={done} onChange={(e) => editHead(setProp(contentRef.current, '完了', e.target.checked ? 'true' : 'false'))} aria-label="完了" />}
-                <h1 className={`document-title ${done ? 'done' : ''}`}>{nameOf(active)}</h1>
+                <input
+                  className={`document-title ${done ? 'done' : ''} ${fresh && fresh === active ? 'auto' : ''}`}
+                  value={title}
+                  placeholder="タイトル(なくてもよい)"
+                  aria-label="タイトル"
+                  title={fresh && fresh === active ? 'タイトルを書かなければ、本文の書き出しを名前にします' : undefined}
+                  onChange={(e) => setTitle(e.target.value)}
+                  onBlur={() => void commitTitle()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.nativeEvent.isComposing) { e.preventDefault(); (e.target as HTMLInputElement).blur(); editorRef.current?.view?.focus() }
+                    if (e.key === 'Escape') { setTitle(active ? nameOf(active) : ''); (e.target as HTMLInputElement).blur() }
+                  }}
+                />
               </div>
               {isTask && <div className="task-line">
                 <label>遂行日<input type="date" value={/^\d{4}-\d{2}-\d{2}/.test(taskDay) ? taskDay.slice(0, 10) : ''} onChange={(e) => e.target.value && editHead(setProp(contentRef.current, '遂行日', e.target.value))} aria-label="遂行日" /></label>
                 {!done && taskDay && taskDay < today() && <span className="late">期限を過ぎています</span>}
                 {!done && taskDay === today() && <span className="today">今日</span>}
               </div>}
-              <NoteMeta
+              {!draft && <NoteMeta
                 text={head}
                 memo={inMemoFolder(active)}
                 fileDate={(() => { const m = notes.find((n) => n.path === active)?.modified_at; return m ? new Date(m).toLocaleDateString('sv-SE') : '' })()}
                 onEdit={editHead}
-              />
+              />}
+              {draft && <div className="meta"><span className="meta-date-ro">{today().replace(/-/g, '/')}</span></div>}
               <div className={`editor-wrap mode-${presentation} ${loading ? 'loading' : ''}`} ref={wrapRef}>
                 <CodeMirror
-                  key={doc.path + ':' + doc.seq}
+                  key={doc.seq}
                   ref={editorRef}
                   value={doc.content}
                   minHeight="60vh"
                   extensions={extensions}
                   theme="light"
                   basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: presentation === 'source', autocompletion: false, searchKeymap: true }}
-                  onChange={(v) => { setText(doc.path, v); engine.edit(doc.path, v) }}
-                  placeholder={presentation === 'notion' ? '書きはじめる…(改行すると見出し・リストなどを選べる)' : '書きはじめる…   / で見出しやリスト、[[ でリンク'}
+                  onChange={onEditorChange}
+                  autoFocus={!doc.path}
+                  placeholder={draft ? '思いついたことを書く…(タイトルは書かなくてもいい)' : presentation === 'notion' ? '書きはじめる…(改行すると見出し・リストなどを選べる)' : '書きはじめる…   / で見出しやリスト、[[ でリンク'}
                 />
                 {showCommands && <div className="command-menu" style={{ top: menuPos.top, left: menuPos.left }}>
                   <div className="command-heading">{menuKind === 'block' ? 'ブロックにする' : '挿入'} <span>↑↓ · Enter · Esc</span></div>
@@ -640,15 +878,59 @@ export default function App() {
                 </div>}
               </div>
             </article>
-          </> : <div className="welcome">
+          </> : <div className="home">
             {notice && <div className="notice">{notice}<button onClick={() => setNotice('')} aria-label="閉じる"><X size={14} /></button></div>}
-            <p className="welcome-lead">{loading ? '開いています…' : apiOk === false ? 'サーバーにつながりません。つながると一覧が出ます。' : '何を書きますか'}</p>
-            <div className="welcome-actions">
-              <button className="btn primary" onClick={() => openNewNote()}><FilePlus2 size={15} /> 新しいメモ</button>
+            <p className="home-date">{new Date().toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' })}</p>
+            <h1 className="home-hello">{greeting()}</h1>
+            <div className="capture">
+              <textarea
+                value={capture}
+                onChange={(e) => { setCapture(e.target.value); store('capture.text', e.target.value) }}
+                placeholder="思いついたことを書く…"
+                rows={3}
+                onKeyDown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing) { e.preventDefault(); void saveCapture() } }}
+                aria-label="すぐ書く"
+              />
+              <div className="capture-bar">
+                <button className={`chip ${captureTask ? 'on' : ''}`} onClick={() => setCaptureTask((v) => !v)}><ListChecks size={14} /> 今日のタスク</button>
+                <span className="capture-hint">Ctrl+Enter で残す · 名前は書き出しから付きます</span>
+                <button className="btn primary" disabled={!capture.trim()} onClick={() => void saveCapture()}>めもに残す</button>
+              </div>
+            </div>
+            {apiOk === false && <p className="home-empty">サーバーにつながりません。つながると一覧が出ます。</p>}
+
+            {(todayTasks.length > 0 || upcoming.length > 0) && <section className="home-sec">
+              <h2>タスク</h2>
+              <div className="task-list">
+                {[...todayTasks, ...upcoming].map((n) => (
+                  <div key={n.path} className={`task-row ${n.done ? 'done' : ''}`}>
+                    <input type="checkbox" checked={!!n.done} onChange={(e) => void setTaskDone(n, e.target.checked)} aria-label={`${n.name} を完了にする`} />
+                    <button onClick={() => void openNote(n.path)}>{n.name}</button>
+                    <small className={n.task_day! < today() ? 'late' : n.task_day === today() ? 'today' : ''}>{n.task_day! < today() ? '期限すぎ ' : n.task_day === today() ? '今日' : ''}{n.task_day === today() ? '' : n.task_day!.slice(5).replace('-', '/')}</small>
+                  </div>
+                ))}
+              </div>
+            </section>}
+
+            {favs.length > 0 && <section className="home-sec">
+              <h2>お気に入り</h2>
+              <div className="fav-chips">{favs.map((f) => <button key={f.path} className="chip" onClick={() => { if (f.kind === 'note') void openNote(f.path); else { setSidebarOpen(true); toggleFolder('fav:' + f.path) } }}><Star size={13} /> {f.path.split('/').pop()!.replace(/\.md$/i, '')}</button>)}</div>
+            </section>}
+
+            {recent.length > 0 && <section className="home-sec">
+              <h2>新しいメモ</h2>
+              <div className="cards">{recent.map((n) => (
+                <button key={n.path} className="card" onClick={() => openNote(n.path)}>
+                  <b>{n.name}</b>
+                  {n.excerpt && <p>{n.excerpt}</p>}
+                  <span className="card-foot"><small>{n.date?.slice(0, 10).replace(/-/g, '/')}</small>{(n.tags || []).slice(0, 3).map((t) => <em key={t}>#{t}</em>)}</span>
+                </button>
+              ))}</div>
+            </section>}
+            <div className="home-more">
+              <button className="btn" onClick={() => openNewNote()}><FilePlus2 size={15} /> 広い画面で書く</button>
               <button className="btn" onClick={() => setSwitcher('')}><Search size={15} /> 探す</button>
             </div>
-            {recent.length > 0 && <><h2>新しいメモ</h2>
-              <div className="recent">{recent.map((n) => <button key={n.path} onClick={() => openNote(n.path)}><b>{n.name}</b><small>{n.date?.slice(0, 10)}</small></button>)}</div></>}
           </div>}
         </main>
       </div>
@@ -662,7 +944,6 @@ export default function App() {
       </div>}
 
       {switcher !== null && <QuickSwitcher notes={notes} initial={switcher} onClose={() => setSwitcher(null)} onOpen={(p) => { setSwitcher(null); void openNote(p) }} onCreate={(name) => openNewNote(name)} />}
-      {newNote && <NewNoteDialog folders={folders} defaultFolder={newNote.folder} defaultName={newNote.name} onClose={() => setNewNote(null)} onCreate={(f, n, kind, day, tags) => createNote(f, n, newNoteContent(kind, { day, tags }))} />}
       {diff && <DiffDialog mine={diff.mine} server={diff.server} onClose={() => setDiff(null)} />}
       {ctx && <Dropdown at={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)} items={ctx.folder ? [
         { label: isFav(ctx.path) ? 'お気に入りから外す' : 'お気に入りにする', onClick: () => void toggleFav(ctx.path, 'folder') },

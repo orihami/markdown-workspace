@@ -36,6 +36,8 @@ export type Note = {
   task?: boolean
   task_day?: string | null
   done?: boolean
+  excerpt?: string // 本文の書き出し(ホームに出す)
+  tags?: string[]
 }
 export type NoteResponse = { path: string; content: string; etag: string; modified_at?: string }
 export type SearchHit = { path: string; name: string; snippet?: string | null }

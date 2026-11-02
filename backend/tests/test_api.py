@@ -221,3 +221,25 @@ def test_favorites_roundtrip(client, vault):
     assert client.get("/api/favorites").json()["items"] == [{"path": "めも", "kind": "folder"}]
     assert client.post("/api/favorites", json={"path": "../x", "kind": "note"}).status_code == 400
     assert sorted(os.listdir(vault)) == ["a.md"]  # Vault には何も書かない
+
+
+def test_tree_has_excerpt_and_tags(client, vault):
+    (vault / "m.md").write_text("---\ndate: '2026-11-02'\n---\n\n#学校 #電気\n\n# 見出し\n\n**太字**と[リンク](https://x)と[[ノート|別名]]\n```\nコード\n```\n", encoding="utf-8")
+    item = next(i for i in client.get("/api/tree").json()["items"] if i["path"] == "m.md")
+    assert item["excerpt"] == "見出し 太字とリンクと別名"
+    assert item["tags"] == ["学校", "電気"]
+
+
+def test_rename(client, vault):
+    etag = client.get("/api/notes/a.md").json()["etag"]
+    client.post("/api/favorites", json={"path": "a.md", "kind": "note"})
+    r = client.post("/api/rename", json={"path": "a.md", "new_path": "b.md", "base_etag": etag})
+    assert r.status_code == 200 and r.json()["path"] == "b.md"
+    assert not (vault / "a.md").exists() and (vault / "b.md").exists()
+    assert client.get("/api/favorites").json()["items"][0]["path"] == "b.md"
+    (vault / "c.md").write_text("c", encoding="utf-8")
+    assert client.post("/api/rename", json={"path": "b.md", "new_path": "c.md"}).status_code == 409
+    assert (vault / "c.md").read_text(encoding="utf-8") == "c"
+    assert client.post("/api/rename", json={"path": "b.md", "new_path": "../x.md"}).status_code == 400
+    (vault / "b.md").write_text("changed", encoding="utf-8")
+    assert client.post("/api/rename", json={"path": "b.md", "new_path": "d.md", "base_etag": etag}).status_code == 409

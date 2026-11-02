@@ -207,8 +207,12 @@ def tree():
                 ).isoformat(),
                 "size": stat.st_size,
             }
-            # 並べ替え・タスクの表示に使うプロパティ(date・遂行日・完了)。ファイルは変えない
-            item.update(sort_props(note_text(rel, path)))
+            # 並べ替え・タスクの表示に使うプロパティ(date・遂行日・完了)と、ホームに出す書き出し・タグ。ファイルは変えない
+            text = note_text(rel, path)
+            item.update(sort_props(text))
+            if text is not None:
+                item["excerpt"] = excerpt_of(text)
+                item["tags"] = sorted(tags_of(text))[:6]
             items.append(item)
     except OSError as exc:
         raise HTTPException(status_code=503, detail=f"Vault read failed: {exc}") from exc
@@ -398,6 +402,30 @@ def sort_props(text: Optional[str]) -> dict:
     if "task_day" in out or "done" in out:
         out["task"] = True
     return out
+
+
+def excerpt_of(text: str, limit: int = 110) -> str:
+    """本文の書き出し(プロパティ・タグの行・見出しの記号・リンクの記号をのぞいた最初の文)"""
+    _, body = split_frontmatter(text)
+    out: list[str] = []
+    fenced = False
+    for line in body:
+        t = line.strip()
+        if FENCE_RE.match(t):
+            fenced = not fenced
+            continue
+        if fenced or not t or re.fullmatch(r"(#[^\s#]+\s*)+", t) or t in ("---", "***"):
+            continue
+        t = re.sub(r"^(#{1,6}\s+|>\s*|[-*+]\s+(\[[ xX]\]\s+)?|\d+\.\s+)", "", t)
+        t = re.sub(r"!?\[\[([^\]|]+)(\|([^\]]+))?\]\]", lambda m: m.group(3) or m.group(1), t)
+        t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)
+        t = re.sub(r"[*_`~]", "", t)
+        if t:
+            out.append(t)
+        if sum(len(x) for x in out) >= limit:
+            break
+    joined = " ".join(out)
+    return joined[:limit] + ("…" if len(joined) > limit else "")
 
 
 def tags_of(text: str) -> set[str]:
@@ -613,6 +641,45 @@ def restore_note(trash_id: int):
     except OSError:
         pass
     return {"ok": True, "path": row[0]}
+
+
+# ---- 名前を変える(同じ Vault の中で移す。上書きはしない) ----
+
+class RenameRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=400)
+    new_path: str = Field(min_length=1, max_length=400)
+    base_etag: Optional[str] = None
+
+
+@app.post("/api/rename", dependencies=[Depends(require_auth)])
+def rename_note(body: RenameRequest):
+    src = safe_note_path(body.path, must_exist=True)
+    dest = safe_note_path(body.new_path)
+    vault = ensure_root()
+    if src == dest:
+        return {"ok": True, "path": body.path, "etag": etag_for(src.read_bytes())}
+    first, second = sorted([src, dest], key=lambda p: str(p))
+    with lock_for(first), lock_for(second):
+        raw = src.read_bytes()
+        etag = etag_for(raw)
+        if body.base_etag and body.base_etag != etag:
+            return JSONResponse(status_code=409, content={"detail": "ほかの場所でこのノートが更新されています", "server_etag": etag})
+        # 大文字小文字だけのちがいは同じファイルとみなす(Windows から見たとき困らないように)
+        if dest.exists() and not (dest.parent == src.parent and dest.name.casefold() == src.name.casefold()):
+            raise HTTPException(status_code=409, detail="同じ名前のノートがもうあります")
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dest)
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail=f"名前を変えられませんでした: {exc}") from exc
+    old_rel = src.relative_to(vault).as_posix()
+    new_rel = dest.relative_to(vault).as_posix()
+    with _text_cache_guard:
+        _text_cache.pop(old_rel, None)
+    with db() as conn:
+        conn.execute("UPDATE OR REPLACE favorites SET path = ? WHERE path = ?", (new_rel, old_rel))
+        conn.commit()
+    return {"ok": True, "path": new_rel, "etag": etag}
 
 
 # ---- お気に入り(どの端末からも同じ。Vault のファイルや Obsidian の設定には書かない) ----

@@ -64,7 +64,9 @@ try {
   page.on('request', (r) => { if (r.method() === 'PUT') puts.push(r.url()) })
 
   await page.goto(base)
-  check(await page.isVisible('.welcome'), 'はじめは「最近のノート」の画面')
+  await page.waitForSelector('.card:has-text("新しいメモ")', { timeout: 10000 }).catch(() => {})
+  check(await page.isVisible('.home .capture textarea') && await page.isVisible('.card:has-text("新しいメモ")'), 'はじめはホーム(すぐ書く欄・新しいメモのカード)')
+  check(await page.isVisible('.task-row:has-text("タスクA")'), 'ホームに今日のタスクが出る')
   await page.waitForSelector('.note-item')
   check(await page.isVisible('.note-item:has-text("新しいメモ")') && !(await page.isVisible('.note-item:has-text("はじめに")')), '左の一覧: めも がはじめから出て、ほかのフォルダは閉じている')
   // めもの並び: date の新しい順、date 無しはそのあと、sortspec は最後
@@ -81,7 +83,7 @@ try {
   check(await page.isVisible('.note-item:has-text("メモ")'), 'フォルダを開くと中のノートが出る')
   await page.click('.note-item:has-text("はじめに")')
   await page.waitForSelector('.cm-content')
-  check((await page.textContent('.document-title')) === 'はじめに', 'ノートを開く(タイトルに .md が付かない)')
+  check((await page.inputValue('.document-title')) === 'はじめに', 'ノートを開く(タイトルに .md が付かない)')
   check(decodeURIComponent(new URL(page.url()).hash) === '#/はじめに.md', 'URL にノートの場所が入る')
 
   // 入力 → 保存済み(randomUUID が無くても送られる)
@@ -131,10 +133,10 @@ try {
   check(tab && tab.url().startsWith('https://example.com/x'), 'URL を押すと新しいタブで開く')
   if (tab) await tab.close()
   await page.click('.cm-lp-wikilink[data-note="メモ"]')
-  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'メモ')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.value === 'メモ')
   check(true, '[[メモ]] を押すと、そのノート(sub/メモ.md)を開く')
   await page.goBack()
-  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'はじめに')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.value === 'はじめに')
   check(true, 'ブラウザの「戻る」で前のノートへ')
 
   // 三点メニュー
@@ -186,7 +188,7 @@ try {
   await page.waitForSelector('.switcher-item em', { timeout: 5000 })
   check((await page.textContent('.switcher-item em')).includes('CRLF'), 'Ctrl+K: 本文から探せて、前後の文が出る')
   await page.keyboard.press('Enter')
-  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'メモ')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.value === 'メモ')
 
   // タグ
   check(!(await page.isVisible('.tag-row')), 'タグはふだん閉じている(一覧を押しつぶさない)')
@@ -206,21 +208,33 @@ try {
   const crlf = read('sub/メモ.md')
   check(crlf.includes('追加') && !/[^\r]\n/.test(crlf), 'CRLF のノートは CRLF のまま')
 
-  // 新しいメモ(Alt+N): ふだんは めも に、date 付きで作る
+  // 新しいメモ(Alt+N): 名前は聞かずにすぐ本文。タイトルを書かなければ書き出しが名前に
   await page.keyboard.press('Alt+n')
-  check((await page.inputValue('.modal select')) === 'めも', '新しく作る場所は、ふだん「めも」')
-  await page.fill('.modal input[placeholder="メモの名前"]', '新規ノート')
-  await page.click('.modal button[type="submit"]')
-  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === '新規ノート')
-  check(read('めも/新規ノート.md') === `---\ndate: '${T}'\n---\n\n`, `新しいメモには date: '${T}' が付く`)
-  // タスク: 遂行日・完了・date の順、タグは閉じ --- のあと空行をはさんで本文の前
+  await page.waitForSelector('input.document-title')
+  check(!(await page.isVisible('.modal')) && await page.evaluate(() => !!document.activeElement?.closest('.cm-editor')), 'Alt+N: 名前は聞かずに、すぐ本文を書ける')
+  await page.keyboard.type('明日の買い物リスト')
+  check(await waitFor(() => existsSync(join(vault, 'めも', '明日の買い物リスト.md')), 15000), 'タイトルを書かなければ、本文の書き出しが名前になる(めもに作る)')
+  check(read('めも/明日の買い物リスト.md').startsWith(`---\ndate: '${T}'\n---\n\n明日の買い物リスト`), `作ったメモには date: '${T}' が付く`)
+  await page.keyboard.type('と牛乳')
+  check(await waitFor(() => existsSync(join(vault, 'めも', '明日の買い物リストと牛乳.md')) && !existsSync(join(vault, 'めも', '明日の買い物リスト.md')), 20000), '作ったばかりのメモは、書き出しを直すと名前もついてくる')
+  await page.fill('input.document-title', '買い物')
+  await page.press('input.document-title', 'Enter')
+  check(await waitFor(() => existsSync(join(vault, 'めも', '買い物.md')), 15000) && read('めも/買い物.md').includes('明日の買い物リストと牛乳'), 'タイトルを書くと、その名前に変わる(中身はそのまま)')
+  check(decodeURIComponent(new URL(page.url()).hash) === '#/めも/買い物.md', '名前を変えると URL も変わる')
+  // タスク: 下書きで「タスクにする」→ タイトルだけ書いて作る → タグを2つ
   await page.keyboard.press('Alt+n')
-  await page.click('.modal .seg button:has-text("タスク")')
-  await page.fill('.modal input[placeholder="タスクの名前"]', '新しいタスク')
-  await page.fill('.modal input[placeholder^="例"]', 'AI 学校')
-  await page.click('.modal button[type="submit"]')
-  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === '新しいタスク')
-  check(read('めも/新しいタスク.md') === `---\n遂行日: ${T}\n完了: false\ndate: '${T}'\n---\n\n#AI #学校\n\n`, 'タスクは 遂行日・完了: false・date、タグは空行のあと')
+  await page.click('.tool:has-text("タスクにする")')
+  await page.fill('input.document-title', '新しいタスク')
+  await page.press('input.document-title', 'Enter')
+  check(await waitFor(() => existsSync(join(vault, 'めも', '新しいタスク.md')), 15000), 'タイトルだけ書いても作れる')
+  await page.waitForSelector('.meta-add')
+  for (const t of ['AI', '学校']) {
+    await page.click('.meta-add')
+    await page.fill('.meta-tag-input', t)
+    await page.press('.meta-tag-input', 'Enter')
+  }
+  await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })
+  check(read('めも/新しいタスク.md') === `---\n遂行日: ${T}\n完了: false\ndate: '${T}'\n---\n\n#AI #学校\n`, 'タスクは 遂行日・完了: false・date、タグは空行のあと')
   check(!(await page.textContent('.cm-content')).includes('遂行日') && !(await page.textContent('.cm-content')).includes('#AI'), 'Obsidian表示ではプロパティとタグの行はエディタに出さない')
   check((await page.textContent('.meta')).includes('#AI') && (await page.textContent('.meta')).includes('#学校'), 'タグはタイトルの下の小さな行に出る')
   // タイトルの前のチェックで 完了 にする → ファイルと一覧の印
@@ -273,24 +287,36 @@ try {
   check(readFileSync(join(trashDir, '整理ログ.md'), 'utf8').includes('`OMNI/めも/古いメモ.md` → `_整理待ち/' + T + '/OMNI/めも/古いメモ.md`'), '消す: 整理ログに「元パス → 新パス」を書く')
   check(!(await page.isVisible('.note-item:has-text("古いメモ")')), '消す: 一覧から消える')
   await page.click('.toast button:has-text("元に戻す")')
-  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === '古いメモ')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.value === '古いメモ')
   check(existsSync(join(vault, 'めも', '古いメモ.md')) && !existsSync(movedTo), '「元に戻す」で元の場所に戻る')
   // 開いているノートを三点メニューから消す → 整理待ちの一覧から戻す
   await page.click('button[aria-label="ノートのメニュー"]')
   await page.click('.dropdown button:has-text("整理待ちへ移す")')
   await page.click('[role="alertdialog"] button:has-text("整理待ちへ移す")')
-  await page.waitForSelector('.welcome')
+  await page.waitForSelector('.home')
   check(!existsSync(join(vault, 'めも', '古いメモ.md')), '三点メニューからも消せる(開いていたノートは閉じる)')
   await page.click('.toast button[aria-label="閉じる"]')
   await page.click('.side-foot button:has-text("整理待ち")')
   await page.waitForSelector('.trash-row:has-text("古いメモ")')
   await page.click('.trash-row:has-text("古いメモ") button:has-text("戻す")')
-  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === '古いメモ')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.value === '古いメモ')
   check(existsSync(join(vault, 'めも', '古いメモ.md')) && readFileSync(join(trashDir, '整理ログ.md'), 'utf8').includes('戻した'), '整理待ちの一覧から戻せる(ログにも書く)')
+
+  // ホーム: すぐ書く欄から残す・タスクをその場で完了にする
+  await page.goto(base + '/#/')
+  await page.reload()
+  await page.waitForSelector('.home .capture textarea')
+  await page.fill('.capture textarea', 'ホームから書いた\n二行目')
+  await page.click('.capture button:has-text("めもに残す")')
+  await page.waitForSelector('.toast:has-text("残しました")')
+  check(read('めも/ホームから書いた.md') === `---\ndate: '${T}'\n---\n\nホームから書いた\n二行目\n`, 'ホームのすぐ書く欄: 書き出しを名前にして、date 付きで めも に残す')
+  // (完了にすると一覧から外れるので、ふつうにクリックしてファイルで確かめる)
+  await page.click('.task-row:has-text("タスクA") input')
+  check(await waitFor(() => read('めも/タスクA.md').includes('完了: true'), 10000), 'ホームのタスクは開かずにチェックで完了にできる')
 
   // API を止めても書ける → 保存済みにならない → 戻ると自動で送る
   await page.click('.note-item:has-text("はじめに")')
-  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'はじめに')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.value === 'はじめに')
   await stopApi()
   await page.click('.cm-content')
   await page.keyboard.press('Control+End')
@@ -305,7 +331,7 @@ try {
 
   // 再読み込みしても同じノート
   await page.reload()
-  await page.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'はじめに')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.value === 'はじめに')
   check((await page.textContent('.cm-content')).includes('止まっている間の入力'), '再読み込みしても同じノートが開き、内容も最新')
 
   // ほかの場所での変更 → 競合。どちらも消えない
@@ -335,7 +361,7 @@ try {
   await m.click('.side-head.toggle:has-text("ほかのフォルダ")')
   await m.click('.tree-folder:has-text("sub")').catch(() => {})
   await m.locator('.note-item').filter({ hasText: /^メモ$/ }).first().click()
-  await m.waitForFunction(() => document.querySelector('.document-title')?.textContent === 'メモ')
+  await m.waitForFunction(() => document.querySelector('.document-title')?.value === 'メモ')
   check(!(await m.isVisible('.sidebar')), 'スマホ幅: ノートを選ぶと一覧が閉じる')
   await m.screenshot({ path: join(work, 'mobile.png') })
   console.log('スクショ: ' + work)

@@ -202,6 +202,31 @@ export class SaveEngine {
     return this.base.get(path)
   }
 
+  // 名前を変える前: 送信待ちが無くなる(サーバーに保存し終わる)まで待つ
+  async settle(path: string, timeoutMs = 10000) {
+    const end = Date.now() + timeoutMs
+    this.schedule(path, 0)
+    for (;;) {
+      await this.writes.get(path)
+      const busy = this.inflight.has(path) || this.timers.has(path) || !!(await getOutbox(path))
+      if (!busy) return this.get(path).status === 'saved'
+      if (this.get(path).status === 'conflict' || Date.now() > end) return false
+      await new Promise((r) => setTimeout(r, 120))
+    }
+  }
+
+  // 名前を変えたあと: 新しい名前で続ける
+  moved(oldPath: string, newPath: string, etag: string) {
+    // 古い名前に残った送信待ちは、画面の内容を新しい名前で送り直すので要らない
+    clearTimeout(this.timers.get(oldPath))
+    this.timers.delete(oldPath)
+    void this.writes.get(oldPath)?.then(() => dropOutbox(oldPath))
+    this.base.delete(oldPath)
+    this.info.delete(oldPath)
+    this.base.set(newPath, etag)
+    this.set(newPath, { status: 'saved', savedAt: Date.now() })
+  }
+
   // 整理待ちへ移したノート: 送信待ちと予定を片づける(もう送らない)
   async forget(path: string) {
     clearTimeout(this.timers.get(path))

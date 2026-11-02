@@ -161,3 +161,41 @@ export function setTags(text: string, tags: string[]): Change[] {
   const body = text.length > fm.to + ws.length
   return [{ from: fm.to, to: fm.to + ws.length, insert: eol + eol + line + eol + (body ? eol : '') }]
 }
+
+// ---- タイトルを書かなかったときの名前: 本文の書き出しから(プロパティ・タグの行・記号はのぞく) ----
+
+export function cleanName(name: string) {
+  return name.replace(/[\\/:*?"<>|#^[\]]/g, ' ').replace(/\s+/g, ' ').trim().replace(/^\.+/, '').slice(0, 80)
+}
+
+export function nameFromBody(text: string, now = new Date()) {
+  const fm = parseFront(text)
+  const tl = tagLine(text)
+  const start = tl ? tl.to : fm ? fm.to : 0
+  for (const raw of text.slice(start).split('\n')) {
+    let t = raw.replace(/\r$/, '').trim()
+    if (!t || /^(#[^\s#]+\s*)+$/.test(t) || /^(```|~~~|---|\*\*\*)/.test(t)) continue
+    t = t.replace(/^(#{1,6}\s+|>\s*|[-*+]\s+(\[[ xX]\]\s+)?|\d+\.\s+)/, '')
+      .replace(/!?\[\[([^\]|]+)(\|([^\]]+))?\]\]/g, (_m, a, _b, c) => c || a)
+      .replace(/!?\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/https?:\/\/\S+/g, '')
+      .replace(/[*_`~]/g, '')
+    t = cleanName(t)
+    if (!t) continue
+    // 長いときは句読点・空白のところで切る(だいたい24文字まで)
+    if (t.length > 24) {
+      const cut = t.slice(0, 28).search(/[。．.!！?？、,，]\s*[^。．.!！?？、,，]*$/)
+      t = cut >= 8 ? t.slice(0, cut) : t.slice(0, 24)
+    }
+    return t.replace(/[。．、,，\s]+$/, '')
+  }
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `メモ ${today(now)} ${p(now.getHours())}${p(now.getMinutes())}`
+}
+
+// 変更をまとめて文字列に当てる(後ろから当てるので位置がずれない)
+export function applyChanges(text: string, changes: Change[]) {
+  let out = text
+  for (const c of [...changes].sort((a, b) => b.from - a.from)) out = out.slice(0, c.from) + c.insert + out.slice(c.to ?? c.from)
+  return out
+}

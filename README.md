@@ -17,7 +17,7 @@ NAS上のMarkdownを唯一の正本として扱う、個人用ブラウザMarkdo
 - アプリは ko-pi の中だけで待ち受け、`tailscale serve` の https（Tailscale 内だけ。Funnel なし）から入る。Tailscale につながった PC・スマホから `https://ko-pi.<tailnet>.ts.net:<ポート>/` で開く。インターネットには出していない
 - **https で開く必要がある**（http だと `crypto.randomUUID`・Service Worker・クリップボードが使えない。2026-11-02 に http で保存が1回も送られなかった）
 - 画面（frontend をビルドした `frontend/dist`）も API と同じポートで配る
-- **今は OMNI のコピー（SSD 上）を相手にしている**。本物の Vault に切り替えるのは、ユーザーが試して問題ないと確認してから
+- 2026-11-02 から本番（HDD の OMNI が正本）。「消す」は HDD の `_整理待ち/日付/OMNI/元のパス` へ移す。OMNI は毎日 SSD に写している（`kopi-omni-snapshot`）
 
 ## 開発・テスト（ko-pi / Linux）
 

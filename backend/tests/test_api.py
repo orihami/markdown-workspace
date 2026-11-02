@@ -201,3 +201,11 @@ def test_trash_needs_configured_place(client, vault, monkeypatch):
 
 def test_trash_rejects_escape(client, vault, trash):
     assert client.post("/api/trash", json={"path": "../x.md"}).status_code == 400
+
+
+def test_tree_skips_venv_and_hidden(client, vault):
+    for d in ("venv/lib", ".git", ".obsidian", "node_modules/x"):
+        (vault / d).mkdir(parents=True)
+        (vault / d / "README.md").write_text("x", encoding="utf-8")
+    paths = [i["path"] for i in client.get("/api/tree").json()["items"]]
+    assert not any(p.startswith(("venv/", ".git/", ".obsidian/", "node_modules/")) for p in paths)

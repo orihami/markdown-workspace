@@ -194,12 +194,7 @@ def tree():
     root = ensure_root()
     items = []
     try:
-        for path in root.rglob("*.md"):
-            if any(part.startswith(".") for part in path.relative_to(root).parts):
-                continue
-            if path.is_symlink() or not path.is_file():
-                continue
-            rel = path.relative_to(root).as_posix()
+        for rel, path in iter_notes(root):
             stat = path.stat()
             item = {
                 "path": rel,
@@ -326,14 +321,20 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 INLINE_TAG_RE = re.compile(r"(?<![\w/#&])#([^\s#\[\](){}.,!?;:'\"`<>|]+)")
 
 
+# 中を見ないフォルダ(隠しフォルダ・Python の環境など)。HDD を毎回すみずみまで読まないよう、入る前に外す
+SKIP_DIRS = {"venv", "node_modules", "__pycache__"}
+
+
 def iter_notes(root: Path):
-    for path in root.rglob("*.md"):
-        rel = path.relative_to(root)
-        if any(part.startswith(".") for part in rel.parts):
-            continue
-        if path.is_symlink() or not path.is_file():
-            continue
-        yield rel.as_posix(), path
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS and not os.path.islink(os.path.join(dirpath, d)))
+        for name in sorted(filenames):
+            if not name.endswith(".md") or name.startswith("."):
+                continue
+            path = Path(dirpath) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            yield path.relative_to(root).as_posix(), path
 
 
 def note_text(rel: str, path: Path) -> Optional[str]:

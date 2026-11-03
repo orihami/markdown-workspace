@@ -920,7 +920,7 @@ export default function App() {
                   minHeight="60vh"
                   extensions={extensions}
                   theme="light"
-                  basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: presentation === 'source', autocompletion: false, searchKeymap: true }}
+                  basicSetup={{ drawSelection: false, lineNumbers: false, foldGutter: false, highlightActiveLine: presentation === 'source', autocompletion: false, searchKeymap: true }}
                   onChange={onEditorChange}
                   autoFocus={!doc.path}
                   onCreateEditor={(view) => { if (!docPathRef.current && view.state.doc.length) view.dispatch({ selection: { anchor: view.state.doc.length } }) }}
@@ -944,7 +944,7 @@ export default function App() {
                   minHeight="96px"
                   extensions={captureExt}
                   theme="light"
-                  basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: false, autocompletion: false, searchKeymap: false }}
+                  basicSetup={{ drawSelection: false, lineNumbers: false, foldGutter: false, highlightActiveLine: false, autocompletion: false, searchKeymap: false }}
                   onChange={(v) => { setCapture(v); store('capture.text', v) }}
                   placeholder="思いついたことを書く…  (# 見出し・- 点・/ 候補もそのまま使えます)"
                 />

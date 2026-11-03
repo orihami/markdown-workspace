@@ -390,3 +390,9 @@ input.document-title:focus { color: var(--ink); }
   .capture-editor .cm-editor { font-size: 16.5px; }
   .capture-bar { flex-wrap: wrap; row-gap: 6px; }
 }
+
+/* カーソル: CodeMirror が自分で描く線ではなく、ブラウザ本来のカーソルを使う。
+   CodeMirror の線は日本語の変換中やスマホでタップした直後に出ないことがあった(2026-11-03)。色は朱で見つけやすく */
+.cm-content { caret-color: var(--accent) !important; }
+.cm-content ::selection, .cm-content::selection { background: #f3d2c2; }
+input, textarea { caret-color: var(--accent); }

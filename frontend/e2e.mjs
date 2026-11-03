@@ -88,6 +88,8 @@ try {
 
   // 入力 → 保存済み(randomUUID が無くても送られる)
   await page.click('.cm-content')
+  const caretOk = await page.evaluate(() => { const el = document.activeElement; const c = getComputedStyle(el).caretColor; return el.classList.contains('cm-content') && c !== 'transparent' && c !== 'rgba(0, 0, 0, 0)' && !document.querySelector('.cm-cursor') })
+  check(caretOk, '押すとカーソルが出る(ブラウザ本来のカーソル。日本語の変換中も消えない)')
   await page.keyboard.press('Control+End')
   await page.keyboard.type('追記した行')
   await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })

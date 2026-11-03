@@ -1,6 +1,6 @@
 # HANDOFF — Markdown Workspace
 
-- 最終更新: 2026-11-03 14:50（日本時間） / 作業場所: ko-pi
+- 最終更新: 2026-11-04 15:15（日本時間） / 作業場所: ko-pi
 
 ## 今の状態
 - 2026-11-02 ユーザーから MVP の zip と仕様書（docs/SPEC.md）を受け取り、ko-pi で動かした
@@ -86,6 +86,14 @@
 - CodeMirror は本物のカーソルを透明にして自分で線を描く（drawSelection）。日本語の変換中やスマホでタップした直後はその線が出ないことがある。テストのブラウザでは線は毎回描かれていた（日本語入力・タッチでだけ起きる）
 - → 本文・すぐ書く欄とも `basicSetup.drawSelection: false` で、ブラウザ本来のカーソルを使う。色は朱（`caret-color`）。タイトル欄など普通の入力欄も同じ色
 - e2e に「押すとカーソルが透明でない」を追加。78項目成功
+
+## 2026-11-04 第1弾: 過去の版・画像・共有メニュー・キー1つのメモ（ユーザーが選んだアイデア）
+- 過去の版: `GET /api/versions/{path}`（毎日の写し `SNAPSHOT_ROOT=~/backup-omni` の日付フォルダ。ハードリンクで同じ中身の日はまとめる）と `?day=`。三点メニュー「過去の版…」で差分を見て「この版に戻す」（エディタの中身を置きかえるだけ。ふつうに保存され、Ctrl+Z で戻せる）
+- 画像: 貼る・落とすと `POST /api/attachments` で OMNI の `etc/`（Obsidian の attachmentFolderPath）に `Pasted image YYYYMMDDHHMMSS.png` で置き、`![[…]]` を入れる。`GET /api/embed?name=`（Vault 全体から名前で探す）/`?src=&note=`（ノートのフォルダから→上から→名前）で出す。Obsidian・Notion表示ではカーソルの無い行を画像で見せる（`![[名前|300]]` の幅も）
+- 共有メニュー: manifest の `share_target` → `POST /share`（文・URL・写真を めも に残して 303 でそのメモへ）。ホーム画面に追加したアプリだけに出る（Android の Chrome）
+- キー1つのメモ: `POST /api/capture {text, task}`（めも に date 付き、名前は書き出し）。Windows は `tools/windows/memo-quick.ahk`（AutoHotkey v2、Ctrl+Alt+M → Ctrl+Enter）。NAS `make/somethingプログラム/memo-quick/` に送り先入りの ini と使い方を置いた。**Windows 実機では未確認**
+- 次: 第2弾（デイリーノート・バックリンクと目次・タグの提案）→ 第3弾（講義棚・記事クリップ・Immich）→ あとまわし（スマホ・PC だけでもある程度動く）
+- テスト: backend 31件、e2e 86項目、成功
 
 ## GitHub
 - 非公開リポジトリ orihami/markdown-workspace。ko-pi からはこのリポジトリ専用の鍵で push（2026-11-02 から）

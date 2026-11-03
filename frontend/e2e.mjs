@@ -26,6 +26,11 @@ writeFileSync(join(vault, 'めも', '日付なし.md'), 'プロパティの無�
 writeFileSync(join(vault, 'めも', 'sortspec.md'), "---\ndate: '2026-09-13'\n---\n\n並べ替えの設定\n")
 const trashDir = join(work, '_整理待ち')
 mkdirSync(trashDir)
+// 毎日の写し(過去の版)
+const snapDir = join(work, 'backup')
+mkdirSync(join(snapDir, '2026-10-20'), { recursive: true })
+writeFileSync(join(snapDir, '2026-10-20', 'はじめに.md'), '# はじめに\n\n昔の内容\n')
+const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 const port = 18000 + Math.floor(Math.random() * 1000)
 const base = `http://127.0.0.1:${port}`
 const read = (p) => readFileSync(join(vault, p), 'utf8')
@@ -36,7 +41,7 @@ let apiProc
 function startApi() {
   apiProc = spawn(join(root, 'backend/.venv/bin/uvicorn'), ['app.main:app', '--host', '127.0.0.1', '--port', String(port)], {
     cwd: join(root, 'backend'),
-    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base, TRASH_ROOT: trashDir, VAULT_LABEL: 'OMNI' },
+    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base, TRASH_ROOT: trashDir, VAULT_LABEL: 'OMNI', SNAPSHOT_ROOT: snapDir },
     stdio: 'ignore',
   })
   return waitFor(async () => (await fetch(base + '/api/health').catch(() => null))?.ok)
@@ -370,6 +375,43 @@ try {
   await page.waitForFunction(() => (document.querySelector('.cm-content')?.textContent || '').includes('Obsidian で書きかえた'))
   const copy = readdirSync(vault).find((f) => f.includes('競合'))
   check(copy && read(copy).includes('ブラウザ側の入力'), `競合: 自分の版を別名で保存(${copy})し、ノートはサーバーの版に`)
+  // 画像を貼る → etc/ に「Pasted image 日時」で置き、![[…]] を入れる。カーソルの無い行では画像で見せる
+  await page.click('.cm-content')
+  await page.keyboard.press('Control+End')
+  await page.keyboard.press('Enter')
+  await page.evaluate((b64) => {
+    const png = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
+    const dt = new DataTransfer()
+    dt.items.add(new File([png], 'x.png', { type: 'image/png' }))
+    document.querySelector('.document .cm-content').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }))
+  }, PNG_B64)
+  check(await waitFor(() => existsSync(join(vault, 'etc')) && readdirSync(join(vault, 'etc')).some((f) => f.startsWith('Pasted image ')), 10000), '画像を貼ると etc/ に「Pasted image 日時.png」で置く(Obsidian と同じ)')
+  await page.waitForSelector('.save-indicator.s-saved', { timeout: 10000 })
+  check(/!\[\[Pasted image \d{14}\.png\]\]/.test(read('はじめに.md')), '本文には ![[Pasted image ….png]] が入る')
+  await page.keyboard.type('画像のあと')
+  await page.click('.cm-line:has-text("Obsidian で書きかえた")')
+  check(await page.waitForFunction(() => { const i = document.querySelector('.cm-lp-img img'); return i && i.complete && i.naturalWidth > 0 }, null, { timeout: 8000 }).then(() => true, () => false), 'カーソルの無い行では、貼った画像が画像として見える')
+  // 過去の版: 差分を見て戻す
+  await page.click('button[aria-label="ノートのメニュー"]')
+  await page.click('.dropdown button:has-text("過去の版")')
+  await page.waitForSelector('.version-days .chip')
+  check((await page.textContent('.diff')).includes('昔の内容'), '過去の版: 毎日の写しから、その日の版との差分が見える')
+  await page.click('.modal button:has-text("この版に戻す")')
+  check(await waitFor(() => read('はじめに.md') === '# はじめに\n\n昔の内容\n', 10000), '過去の版: 「この版に戻す」でその日の中身に戻る(ふつうの保存として)')
+  await page.keyboard.press('Control+z')
+  check(await waitFor(() => read('はじめに.md').includes('Obsidian で書きかえた'), 10000), '過去の版: 戻しても Ctrl+Z で元に戻せる')
+  // スマホの「共有」メニュー(文・URL・写真) → めも に残して、そのメモを開く
+  const fd = new FormData()
+  fd.append('title', '共有した記事')
+  fd.append('text', '読みたい')
+  fd.append('url', 'https://example.com/b')
+  fd.append('files', new Blob([Buffer.from(PNG_B64, 'base64')], { type: 'image/png' }), 'p.png')
+  const sr = await fetch(base + '/share', { method: 'POST', body: fd, redirect: 'manual' })
+  const shared = existsSync(join(vault, 'めも', '共有した記事.md')) ? read('めも/共有した記事.md') : ''
+  check(sr.status === 303 && decodeURIComponent(sr.headers.get('location')).endsWith('#/めも/共有した記事.md') && shared.startsWith(`---\ndate: '${T}'\n---\n\n読みたい\n\nhttps://example.com/b\n\n![[Pasted image `), '共有メニュー: 文・URL・写真を めも に残し、そのメモへ')
+  // Windows のキー1つのメモ(AutoHotkey)が使う /api/capture
+  const cr = await fetch(base + '/api/capture', { method: 'POST', headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify({ text: 'パソコンから一言\n続き', task: false }) })
+  check(cr.ok && read('めも/パソコンから一言.md') === `---\ndate: '${T}'\n---\n\nパソコンから一言\n続き\n`, 'キー1つのメモ: 送った文が、書き出しの名前で めも に残る')
   await page.screenshot({ path: join(work, 'desktop.png') })
 
   // スマホ幅: 一覧は閉じていて、開いてノートを選ぶと閉じる

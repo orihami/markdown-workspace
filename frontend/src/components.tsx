@@ -504,3 +504,53 @@ export function MobileBar({ view, inset, commands, menu, onPick, onClose }: {
     </div>
   )
 }
+
+// ---- 過去の版(毎日の写し)。差分を見て、戻すときはエディタの中身を置きかえる(Ctrl+Z で元に戻せる) ----
+
+export function VersionsDialog({ path, current, onRestore, onClose }: {
+  path: string
+  current: string
+  onRestore: (content: string, day: string) => void
+  onClose: () => void
+}) {
+  const [days, setDays] = useState<{ day: string; size: number }[] | null>(null)
+  const [day, setDay] = useState('')
+  const [content, setContent] = useState<string | null>(null)
+  const [error, setError] = useState('')
+  const url = (q = '') => '/api/versions/' + path.split('/').map(encodeURIComponent).join('/') + q
+  useEffect(() => {
+    api<{ items: { day: string; size: number }[] }>(url())
+      .then((r) => { setDays(r.items); if (r.items[0]) setDay(r.items[0].day) })
+      .catch((e) => { setError((e as Error).message); setDays([]) })
+  }, [path])
+  useEffect(() => {
+    if (!day) return
+    setContent(null)
+    api<{ content: string }>(url(`?day=${day}`)).then((r) => setContent(r.content)).catch((e) => setError((e as Error).message))
+  }, [day])
+  const lines = useMemo(() => (content === null ? [] : lineDiff(current, content)), [current, content])
+  const same = content !== null && content === current
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="modal wide" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label="過去の版">
+        <div className="modal-head"><h2>過去の版</h2><button className="icon-button" onClick={onClose} aria-label="閉じる"><X size={16} /></button></div>
+        <p className="delete-info">毎朝 ko-pi に写している控えから。同じ中身の日はまとめています。戻しても Ctrl+Z で元に戻せます。</p>
+        {error && <p className="field-error">{error}</p>}
+        {days && days.length === 0 && !error && <p className="delete-info">このノートの過去の版はまだありません(写しは毎朝 5:23 に作られます)</p>}
+        {days && days.length > 0 && <div className="version-days">
+          {days.map((d) => <button key={d.day} className={`chip ${day === d.day ? 'on' : ''}`} onClick={() => setDay(d.day)}>{d.day.slice(5).replace('-', '/')}</button>)}
+        </div>}
+        {content !== null && (same
+          ? <p className="delete-info">この日の版は、いまと同じです。</p>
+          : <>
+              <p className="diff-legend"><span className="mine">＋ いまだけにある行</span><span className="server">− {day} の版だけにある行</span></p>
+              <pre className="diff">{lines.map((l, k) => <div key={k} className={`diff-${l.kind}`}>{l.kind === 'mine' ? '+ ' : l.kind === 'server' ? '- ' : '  '}{l.text || ' '}</div>)}</pre>
+            </>)}
+        <div className="modal-actions">
+          <button className="btn" onClick={onClose}>閉じる</button>
+          <button className="btn primary" disabled={content === null || same} onClick={() => content !== null && onRestore(content, day)}>この版に戻す</button>
+        </div>
+      </div>
+    </div>
+  )
+}

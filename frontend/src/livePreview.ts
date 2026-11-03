@@ -40,6 +40,30 @@ class CheckWidget extends WidgetType {
   ignoreEvent() { return false }
 }
 
+// 画像(![[名前]] と ![説明](道のり))。カーソルのある行では原文を見せ、ほかの行では画像を見せる
+class ImageWidget extends WidgetType {
+  constructor(readonly src: string, readonly alt: string, readonly width: number | null) { super() }
+  eq(o: ImageWidget) { return o.src === this.src && o.width === this.width }
+  toDOM() {
+    const wrap = document.createElement('span')
+    wrap.className = 'cm-lp-img'
+    const img = document.createElement('img')
+    img.src = this.src
+    img.alt = this.alt
+    img.loading = 'lazy'
+    if (this.width) img.style.width = this.width + 'px'
+    img.onerror = () => { wrap.textContent = `画像が見つかりません: ${this.alt}`; wrap.classList.add('missing') }
+    wrap.append(img)
+    return wrap
+  }
+  ignoreEvent() { return false }
+}
+export function embedSrc(target: string, note: string) {
+  if (/^(https?:|data:)/i.test(target)) return target
+  return `/api/embed?src=${encodeURIComponent(decodeURIComponent(target))}&note=${encodeURIComponent(note)}`
+}
+const IMG_EXT = /\.(png|jpe?g|gif|webp|heic|heif|avif|bmp|svg)$/i
+
 const hidden = Decoration.replace({})
 const bullet = Decoration.replace({ widget: new BulletWidget() })
 const lineClass = (cls: string) => Decoration.line({ class: cls })
@@ -58,7 +82,7 @@ export function frontmatterEnd(doc: Text): number {
 
 const linkMark = (cls: string, attrs: Record<string, string>) => Decoration.mark({ class: cls, attributes: attrs })
 
-function build(view: EditorView, mode: LiveMode): { all: DecorationSet; atomic: DecorationSet } {
+function build(view: EditorView, mode: LiveMode, note: string): { all: DecorationSet; atomic: DecorationSet } {
   const source = mode === 'source'
   const { state } = view
   const doc = state.doc
@@ -144,6 +168,15 @@ function build(view: EditorView, mode: LiveMode): { all: DecorationSet; atomic: 
             const checked = /x/i.test(doc.sliceString(node.from, node.to))
             atomic.push(Decoration.replace({ widget: new CheckWidget(checked, node.from) }).range(node.from, node.to))
           }
+        } else if (name === 'Image') {
+          // ![説明](道のり)
+          const url = node.node.getChild('URL')
+          if (!source && url && !isActive(node.from)) {
+            const target = doc.sliceString(url.from, url.to)
+            const alt = doc.sliceString(node.from + 2, doc.sliceString(node.from, node.to).indexOf('](') + node.from)
+            atomic.push(Decoration.replace({ widget: new ImageWidget(embedSrc(target, note), alt || target, null) }).range(node.from, node.to))
+          }
+          return false
         } else if (name === 'Link') {
           // [文字](URL) → 文字だけ見せる。押すと URL を開く
           const url = node.node.getChild('URL')
@@ -176,6 +209,14 @@ function build(view: EditorView, mode: LiveMode): { all: DecorationSet; atomic: 
           const inner = mm[1]
           const bar = inner.indexOf('|')
           const target = (bar >= 0 ? inner.slice(0, bar) : inner).split('#')[0].trim()
+          // ![[画像]] は画像として見せる(![[名前|300]] は幅 300)
+          if (s > line.from && text[mm.index! - 1] === '!' && IMG_EXT.test(target)) {
+            if (!source && !isActive(s)) {
+              const w = bar >= 0 ? parseInt(inner.slice(bar + 1), 10) : NaN
+              atomic.push(Decoration.replace({ widget: new ImageWidget(`/api/embed?name=${encodeURIComponent(target)}`, target, Number.isFinite(w) ? w : null) }).range(s - 1, e))
+            }
+            continue
+          }
           decos.push(linkMark('cm-lp-wikilink', { 'data-note': target }).range(s + 2, e - 2))
           hide(s, s + 2)
           if (bar >= 0) hide(s + 2, s + 3 + bar)
@@ -224,17 +265,50 @@ const keepCursorOutOfFront = EditorState.transactionFilter.of((tr) => {
   return [tr, { selection: { anchor: fixed[0].anchor, head: fixed[0].head }, sequential: true }]
 })
 
-export function livePreview(mode: LiveMode, onLink: LinkHandler) {
+// 画像を貼る・落とす: ファイルを upload に渡し、返ってきた Markdown(![[名前]])をカーソルの所に入れる
+export function pasteImages(upload: (file: File) => Promise<string | null>) {
+  const put = (view: EditorView, files: File[], pos?: number) => {
+    const imgs = files.filter((f) => /^image\//.test(f.type) || IMG_EXT.test(f.name))
+    if (!imgs.length) return false
+    void (async () => {
+      for (const f of imgs) {
+        const md = await upload(f)
+        if (!md) continue
+        const at = pos ?? view.state.selection.main.head
+        const line = view.state.doc.lineAt(at)
+        const insert = (line.text.trim() && at === line.to ? '\n' : '') + md + '\n'
+        view.dispatch({ changes: { from: at, insert }, selection: { anchor: at + insert.length }, userEvent: 'input.paste' })
+        pos = undefined
+      }
+    })()
+    return true
+  }
+  return EditorView.domEventHandlers({
+    paste(e, view) {
+      const files = [...(e.clipboardData?.files || [])]
+      if (put(view, files)) { e.preventDefault(); return true }
+      return false
+    },
+    drop(e, view) {
+      const files = [...(e.dataTransfer?.files || [])]
+      const pos = view.posAtCoords({ x: e.clientX, y: e.clientY }) ?? undefined
+      if (put(view, files, pos)) { e.preventDefault(); return true }
+      return false
+    },
+  })
+}
+
+export function livePreview(mode: LiveMode, onLink: LinkHandler, getNote: () => string = () => '') {
   const plugin = ViewPlugin.fromClass(
     class {
       decorations: DecorationSet
       atomic: DecorationSet
       constructor(view: EditorView) {
-        ;({ all: this.decorations, atomic: this.atomic } = build(view, mode))
+        ;({ all: this.decorations, atomic: this.atomic } = build(view, mode, getNote()))
       }
       update(u: ViewUpdate) {
         if (u.docChanged || u.viewportChanged || u.selectionSet || u.focusChanged || syntaxTree(u.state) !== syntaxTree(u.startState)) {
-          ;({ all: this.decorations, atomic: this.atomic } = build(u.view, mode))
+          ;({ all: this.decorations, atomic: this.atomic } = build(u.view, mode, getNote()))
         }
       }
     },

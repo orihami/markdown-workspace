@@ -243,3 +243,49 @@ def test_rename(client, vault):
     assert client.post("/api/rename", json={"path": "b.md", "new_path": "../x.md"}).status_code == 400
     (vault / "b.md").write_text("changed", encoding="utf-8")
     assert client.post("/api/rename", json={"path": "b.md", "new_path": "d.md", "base_etag": etag}).status_code == 409
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+
+def test_upload_and_embed(client, vault):
+    r = client.post("/api/attachments", files={"file": ("x.png", PNG, "image/png")})
+    assert r.status_code == 200, r.text
+    name = r.json()["name"]
+    assert name.startswith("Pasted image ") and name.endswith(".png") and r.json()["markdown"] == f"![[{name}]]"
+    assert (vault / "etc" / name).read_bytes() == PNG
+    assert client.get("/api/embed", params={"name": name}).content == PNG
+    (vault / "めも" / "_attachments").mkdir(parents=True)
+    (vault / "めも" / "_attachments" / "y.png").write_bytes(PNG)
+    assert client.get("/api/embed", params={"src": "_attachments/y.png", "note": "めも/n.md"}).status_code == 200
+    assert client.get("/api/embed", params={"name": "ない.png"}).status_code == 404
+    assert client.get("/api/files/../secret.png").status_code in (400, 404)
+    assert client.post("/api/attachments", files={"file": ("x.exe", b"MZ", "application/octet-stream")}).status_code == 415
+
+
+def test_versions(client, vault, tmp_path, monkeypatch):
+    snap = tmp_path / "backup"
+    for day, text in (("2026-11-01", "一日目"), ("2026-11-02", "二日目"), ("2026-11-03", "二日目")):
+        (snap / day / "めも").mkdir(parents=True)
+        (snap / day / "めも" / "n.md").write_text(text, encoding="utf-8")
+    # 11-02 と 11-03 は同じファイル(ハードリンク)
+    (snap / "2026-11-03" / "めも" / "n.md").unlink()
+    os.link(snap / "2026-11-02" / "めも" / "n.md", snap / "2026-11-03" / "めも" / "n.md")
+    monkeypatch.setattr(main, "SNAPSHOT_ROOT", snap)
+    days = [i["day"] for i in client.get("/api/versions/めも/n.md").json()["items"]]
+    assert days == ["2026-11-03", "2026-11-01"]
+    assert client.get("/api/versions/めも/n.md", params={"day": "2026-11-01"}).json()["content"] == "一日目"
+    assert client.get("/api/versions/めも/n.md", params={"day": "../x"}).status_code == 400
+    assert client.get("/api/versions/../etc/passwd.md").status_code in (400, 404)
+
+
+def test_capture_and_share(client, vault):
+    r = client.post("/api/capture", json={"text": "牛乳を買う。あと卵も", "task": True})
+    path = r.json()["path"]
+    assert path == "めも/牛乳を買う。あと卵も.md"  # 24文字までは切らない(画面と同じ)
+    text = (vault / path).read_text(encoding="utf-8")
+    assert text.startswith("---\n遂行日: ") and "完了: false\ndate: '" in text and text.endswith("---\n\n牛乳を買う。あと卵も\n")
+    r = client.post("/share", data={"title": "よい記事", "text": "読みたい", "url": "https://example.com/a"}, files={"files": ("p.jpg", PNG, "image/jpeg")}, follow_redirects=False)
+    assert r.status_code == 303 and "よい記事" in __import__("urllib.parse").parse.unquote(r.headers["location"])
+    shared = (vault / "めも" / "よい記事.md").read_text(encoding="utf-8")
+    assert "読みたい\n\nhttps://example.com/a\n\n![[Pasted image " in shared

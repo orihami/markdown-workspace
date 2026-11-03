@@ -13,9 +13,9 @@ from typing import Optional
 from uuid import UUID
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -29,6 +29,14 @@ ALLOWED_ORIGINS = [
     if item.strip()
 ]
 DB_PATH = Path(os.getenv("WORKSPACE_DB", "./workspace-state.sqlite3")).resolve()
+# 毎日の写し(kopi-omni-snapshot が作る ~/backup-omni/日付/)。ノートの「過去の版」に使う。読むだけ
+SNAPSHOT_ROOT = Path(os.getenv("SNAPSHOT_ROOT")).expanduser() if os.getenv("SNAPSHOT_ROOT") else None
+# 貼った画像の置き場所(Obsidian の attachmentFolderPath と同じにする)と、新しいメモの置き場所
+ATTACH_DIR = os.getenv("ATTACH_DIR", "etc")
+MEMO_DIR = os.getenv("MEMO_DIR", "めも")
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".heif", ".avif", ".bmp", ".svg"}
+FILE_EXT = IMAGE_EXT | {".pdf", ".mp4", ".mov", ".m4a", ".mp3", ".wav"}
 # 「消す」= 整理待ちへ移す(NAS のきまり: 削除はしない。_整理待ち/<日付>/ に元のパスのまま移し、整理ログ.md に書く)
 TRASH_ROOT = Path(os.getenv("TRASH_ROOT")).expanduser() if os.getenv("TRASH_ROOT") else None
 VAULT_LABEL = os.getenv("VAULT_LABEL") or VAULT_ROOT.name
@@ -680,6 +688,233 @@ def rename_note(body: RenameRequest):
         conn.execute("UPDATE OR REPLACE favorites SET path = ? WHERE path = ?", (new_rel, old_rel))
         conn.commit()
     return {"ok": True, "path": new_rel, "etag": etag}
+
+
+# ---- 画像・添付(貼る・見る) ----
+
+def safe_vault_file(relative: str) -> Path:
+    """Vault の中の .md 以外のファイル(画像など)。Vault の外・隠しフォルダ・シンボリックリンクは断る"""
+    root = ensure_root()
+    pure = PurePosixPath(relative.replace("\\", "/"))
+    if pure.is_absolute() or not pure.parts or any(p in ("", ".", "..") or p.startswith(".") for p in pure.parts):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if pure.suffix.lower() not in FILE_EXT:
+        raise HTTPException(status_code=400, detail="この種類のファイルは出せません")
+    path = root.joinpath(*pure.parts)
+    try:
+        path.resolve(strict=True).relative_to(root)
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="Not found")
+    if path.is_symlink() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    return path
+
+
+_name_index: dict[str, str] = {}
+_name_index_at = 0.0
+
+
+def find_by_name(name: str) -> Optional[str]:
+    """![[名前]] の名前から、Vault の中のファイルを探す(Obsidian と同じく、どのフォルダにあってもよい)"""
+    global _name_index_at
+    key = name.strip().casefold()
+    now = datetime.now().timestamp()
+    if key not in _name_index or now - _name_index_at > 60:
+        root = ensure_root()
+        idx: dict[str, str] = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS]
+            for f in filenames:
+                if Path(f).suffix.lower() in FILE_EXT:
+                    idx.setdefault(f.casefold(), (Path(dirpath) / f).relative_to(root).as_posix())
+        _name_index.clear()
+        _name_index.update(idx)
+        _name_index_at = now
+    return _name_index.get(key)
+
+
+@app.get("/api/files/{file_path:path}", dependencies=[Depends(require_auth)])
+def get_file(file_path: str):
+    return FileResponse(safe_vault_file(file_path), headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/api/embed", dependencies=[Depends(require_auth)])
+def get_embed(name: str = "", src: str = "", note: str = ""):
+    """画像を出す。name = ![[名前]] の名前。src = ![](道のり)(ノートのフォルダから、なければ Vault の一番上から、それでもなければ名前で)"""
+    candidates: list[str] = []
+    if src:
+        folder = str(PurePosixPath(note).parent) if note else ""
+        candidates += [str(PurePosixPath(folder) / src) if folder not in ("", ".") else src, src]
+    for c in candidates:
+        try:
+            parts = []
+            for part in PurePosixPath(c).parts:
+                if part == "..":
+                    if parts:
+                        parts.pop()
+                elif part not in ("", "."):
+                    parts.append(part)
+            return FileResponse(safe_vault_file("/".join(parts)), headers={"Cache-Control": "private, max-age=86400"})
+        except HTTPException:
+            continue
+    found = find_by_name(name or PurePosixPath(src).name)
+    if not found:
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(safe_vault_file(found), headers={"Cache-Control": "private, max-age=86400"})
+
+
+def save_upload(data: bytes, filename: str) -> str:
+    """貼った画像を Vault の etc/ に「Pasted image 日時.拡張子」で置く(Obsidian と同じ名前の付け方)。置いた名前を返す"""
+    ext = Path(filename or "").suffix.lower() or ".png"
+    if ext == ".jpeg":
+        ext = ".jpg"
+    if ext not in FILE_EXT:
+        raise HTTPException(status_code=415, detail="この種類のファイルは貼れません")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="ファイルが大きすぎます")
+    root = ensure_root()
+    folder = root / ATTACH_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().astimezone().strftime("%Y%m%d%H%M%S")
+    base = f"Pasted image {stamp}" if ext in IMAGE_EXT else (cleanup_name(Path(filename).stem) or f"file {stamp}")
+    name = f"{base}{ext}"
+    n = 1
+    while (folder / name).exists():
+        n += 1
+        name = f"{base} {n}{ext}"
+    with lock_for(folder / name):
+        atomic_write(folder / name, data)
+    _name_index[name.casefold()] = f"{ATTACH_DIR}/{name}"
+    return name
+
+
+@app.post("/api/attachments", dependencies=[Depends(require_auth)])
+async def upload_attachment(file: UploadFile = File(...)):
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
+    name = save_upload(data, file.filename or "image.png")
+    return {"ok": True, "name": name, "path": f"{ATTACH_DIR}/{name}", "markdown": f"![[{name}]]"}
+
+
+# ---- 過去の版(毎日の写しから) ----
+
+def snapshot_days() -> list[Path]:
+    if SNAPSHOT_ROOT is None or not SNAPSHOT_ROOT.is_dir():
+        return []
+    return sorted((d for d in SNAPSHOT_ROOT.iterdir() if d.is_dir() and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.name)), key=lambda d: d.name, reverse=True)
+
+
+@app.get("/api/versions/{note_path:path}", dependencies=[Depends(require_auth)])
+def list_versions(note_path: str, day: str = ""):
+    safe_note_path(note_path)  # パスの形だけ確かめる(今は無くても、過去の版は見られる)
+    rel = PurePosixPath(note_path.replace("\\", "/"))
+    if day:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+            raise HTTPException(status_code=400, detail="Invalid day")
+        for d in snapshot_days():
+            if d.name == day:
+                f = d.joinpath(*rel.parts)
+                try:
+                    f.resolve(strict=True).relative_to(d.resolve())
+                    raw = f.read_bytes()
+                except (OSError, ValueError):
+                    break
+                return {"day": day, "content": raw.decode("utf-8", errors="replace"), "etag": etag_for(raw)}
+        raise HTTPException(status_code=404, detail="その日の版はありません")
+    items = []
+    last = None
+    for d in snapshot_days():
+        f = d.joinpath(*rel.parts)
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        # 中身が同じ日(ハードリンクで同じファイル)はまとめる。新しい日を残す
+        key = (st.st_ino, st.st_size)
+        if key == last:
+            continue
+        last = key
+        items.append({"day": d.name, "size": st.st_size, "modified_at": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()})
+    return {"items": items}
+
+
+# ---- すぐメモを作る(キー1つのメモ窓・スマホの共有・ボットから) ----
+
+def cleanup_name(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|#^\[\]]', " ", name)
+    return re.sub(r"\s+", " ", name).strip().lstrip(".")[:80]
+
+
+def name_from_body(text: str) -> str:
+    for line in text.splitlines():
+        t = line.strip()
+        if not t or re.fullmatch(r"(#[^\s#]+\s*)+", t) or re.match(r"^(```|~~~|---)", t):
+            continue
+        t = re.sub(r"^(#{1,6}\s+|>\s*|[-*+]\s+(\[[ xX]\]\s+)?|\d+\.\s+)", "", t)
+        t = re.sub(r"!?\[\[([^\]|]+)(\|([^\]]+))?\]\]", lambda m: m.group(3) or m.group(1), t)
+        t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)
+        t = re.sub(r"https?://\S+", "", t)
+        t = cleanup_name(re.sub(r"[*_`~]", "", t))
+        if not t:
+            continue
+        if len(t) > 24:
+            m = re.search(r"[。．.!！?？、,，]", t[8:28])
+            t = t[: 8 + m.start()] if m else t[:24]
+        return t.rstrip("。．、,， ")
+    return "メモ " + datetime.now().astimezone().strftime("%Y-%m-%d %H%M")
+
+
+def create_memo(body: str, task: bool = False, title: str = "") -> str:
+    """めも に date 付きのメモを作る(タスクなら 遂行日・完了・date)。名前はタイトルか本文の書き出し。作ったパスを返す"""
+    root = ensure_root()
+    day = datetime.now().astimezone().strftime("%Y-%m-%d")
+    head = f"---\n遂行日: {day}\n完了: false\ndate: '{day}'\n---\n" if task else f"---\ndate: '{day}'\n---\n"
+    content = head + "\n" + body.strip() + "\n"
+    base = cleanup_name(title) or name_from_body(body)
+    folder = root / MEMO_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    for n in range(1, 50):
+        name = base if n == 1 else f"{base} {n}"
+        path = folder / f"{name}.md"
+        with lock_for(path):
+            if path.exists():
+                continue
+            payload = content.encode("utf-8")
+            if len(payload) > MAX_NOTE_BYTES:
+                raise HTTPException(status_code=413, detail="Note exceeds configured size limit")
+            atomic_write(path, payload)
+            return path.relative_to(root).as_posix()
+    raise HTTPException(status_code=409, detail="同じ名前のノートが多すぎます")
+
+
+class CaptureRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=200000)
+    task: bool = False
+    title: str = ""
+
+
+@app.post("/api/capture", dependencies=[Depends(require_auth)])
+def capture(body: CaptureRequest):
+    return {"ok": True, "path": create_memo(body.text, body.task, body.title)}
+
+
+@app.post("/share", include_in_schema=False)
+async def share_target(title: str = Form(""), text: str = Form(""), url: str = Form(""), files: list[UploadFile] = File(default=[])):
+    """スマホの「共有」メニューから(ホーム画面に追加したアプリ)。文・URL・写真をそのまま めも に残して、そのメモを開く"""
+    lines: list[str] = []
+    if text.strip():
+        lines.append(text.strip())
+    if url.strip() and url.strip() not in text:
+        lines.append(url.strip())
+    for f in files or []:
+        data = await f.read(MAX_UPLOAD_BYTES + 1)
+        if data:
+            lines.append(f"![[{save_upload(data, f.filename or 'image.jpg')}]]")
+    if not lines and not title.strip():
+        return RedirectResponse("/", status_code=303)
+    # タイトルが本文に含まれていなければ、タイトルを名前にする(記事を共有したとき)
+    name_title = title.strip() if title.strip() and title.strip() not in text else ""
+    path = create_memo("\n\n".join(lines) or title.strip(), title=name_title)
+    return RedirectResponse("/#/" + "/".join(p for p in path.split("/")), status_code=303)
 
 
 # ---- お気に入り(どの端末からも同じ。Vault のファイルや Obsidian の設定には書かない) ----

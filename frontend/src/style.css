@@ -396,3 +396,9 @@ input.document-title:focus { color: var(--ink); }
 .cm-content { caret-color: var(--accent) !important; }
 .cm-content ::selection, .cm-content::selection { background: #f3d2c2; }
 input, textarea { caret-color: var(--accent); }
+
+/* 画像(本文の中) */
+.cm-lp-img { display: inline-block; max-width: 100%; margin: 6px 0; vertical-align: top; }
+.cm-lp-img img { display: block; max-width: 100%; max-height: 70vh; height: auto; border-radius: 10px; box-shadow: 0 2px 10px rgba(35, 33, 29, 0.08); }
+.cm-lp-img.missing { font-size: 13px; color: var(--muted); background: var(--side); border-radius: 8px; padding: 6px 10px; }
+.version-days { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }

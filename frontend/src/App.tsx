@@ -6,9 +6,9 @@ import { Prec } from '@codemirror/state'
 import { AlertTriangle, Check, ChevronRight, CircleDot, CloudOff, FilePlus2, Hash, ListChecks, Loader2, Menu, MoreHorizontal, Plus, Search, Settings2, Star, Trash2, Wifi, WifiOff, X } from 'lucide-react'
 import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
-import { livePreview, LiveMode } from './livePreview'
+import { livePreview, LiveMode, pasteImages } from './livePreview'
 import { slashSource, workspaceCompletions } from './completions'
-import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, useKeyboardInset } from './components'
+import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, useKeyboardInset, VersionsDialog } from './components'
 import { applyChanges, cleanName, inMemoFolder, makeTask, MEMO_FOLDER, nameFromBody, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
 import { uuid } from './uuid'
 
@@ -69,6 +69,7 @@ export default function App() {
   const [noteMenu, setNoteMenu] = useState(false)
   const [settings, setSettings] = useState(false)
   const [diff, setDiff] = useState<{ mine: string; server: string } | null>(null)
+  const [versionsOpen, setVersionsOpen] = useState(false)
   const [notice, setNotice] = useState('')
   const [vaultName, setVaultName] = useState(() => load('obsidian.vault', 'OMNI'))
   // 並べ替え(OMNIメモアプリと同じ種類。めもの sortspec と同じ「日付が新しい順」が最初)
@@ -584,6 +585,22 @@ export default function App() {
     { key: 'Escape', run: () => { if (!menuRef.current.open) return false; setShowCommands(false); return true } },
   ])), [])
   const completions = useMemo(() => workspaceCompletions(() => notesRef.current, () => tagsRef.current), [])
+  // 画像を貼る・落とす: OMNI の etc/ に「Pasted image 日時」で置き、![[名前]] を入れる(Obsidian と同じ)
+  const uploadRef = useRef<(f: File) => Promise<string | null>>(async () => null)
+  uploadRef.current = async (file: File) => {
+    const form = new FormData()
+    form.append('file', file, file.name || 'image.png')
+    try {
+      const r = await fetch('/api/attachments', { method: 'POST', body: form })
+      const body = await r.json().catch(() => null)
+      if (!r.ok) throw new Error((body && body.detail) || `HTTP ${r.status}`)
+      return body.markdown as string
+    } catch (e) {
+      setToast({ text: `画像を貼れませんでした: ${(e as Error).message}` })
+      return null
+    }
+  }
+  const paste = useMemo(() => pasteImages((f) => uploadRef.current(f)), [])
   // どのエディタで書いているか(スマホの操作列をそのエディタに効かせる)
   const [focusView, setFocusView] = useState<EditorView | null>(null)
   const focusExt = useMemo(() => EditorView.updateListener.of((u) => {
@@ -601,8 +618,9 @@ export default function App() {
     Prec.highest(keymap.of([{ key: 'Mod-Enter', run: () => { void saveCaptureRef.current(); return true } }])),
     workspaceCompletions(() => notesRef.current, () => tagsRef.current, [slashSource(commands)]),
     livePreview('obsidian', (k, t) => linkRef.current(k, t)),
+    paste,
     focusExt,
-  ], [focusExt])
+  ], [focusExt, paste])
   saveCaptureRef.current = saveCapture
   const extensions = useMemo(() => [
     markdown({ base: markdownLanguage }),
@@ -611,8 +629,9 @@ export default function App() {
     menuListener,
     completions,
     focusExt,
-    livePreview(presentation, (k, t) => linkRef.current(k, t)),
-  ], [presentation, commandKeys, menuListener, completions, focusExt])
+    paste,
+    livePreview(presentation, (k, t) => linkRef.current(k, t), () => docPathRef.current),
+  ], [presentation, commandKeys, menuListener, completions, focusExt, paste])
 
   // パソコン: ページを動かしたら候補は閉じる(カーソルから離れた所に残らないように)
   useEffect(() => {
@@ -679,6 +698,7 @@ export default function App() {
     { label: 'パスをコピー', onClick: async () => { try { await navigator.clipboard.writeText(active); setNotice('パスをコピーしました') } catch { window.prompt('パス', active) } } },
     { label: 'Markdown をダウンロード', onClick: () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([contentRef.current], { type: 'text/markdown' })); a.download = active.split('/').pop()!; a.click(); URL.revokeObjectURL(a.href) } },
     { label: 'サーバーから読み直す', onClick: () => void openNote(active, { push: false }) },
+    { label: '過去の版…', onClick: () => setVersionsOpen(true) },
     'sep',
     { label: 'このフォルダに新しく作る', onClick: () => openNewNote('', folderOf(active)) },
     'sep',
@@ -1004,6 +1024,12 @@ export default function App() {
 
       {switcher !== null && <QuickSwitcher notes={notes} initial={switcher} onClose={() => setSwitcher(null)} onOpen={(p) => { setSwitcher(null); void openNote(p) }} onCreate={(name) => openNewNote(name)} />}
       {diff && <DiffDialog mine={diff.mine} server={diff.server} onClose={() => setDiff(null)} />}
+      {versionsOpen && active && <VersionsDialog path={active} current={contentRef.current} onClose={() => setVersionsOpen(false)} onRestore={(content, day) => {
+        const view = editorRef.current?.view
+        if (view) view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content }, userEvent: 'input.restore' })
+        setVersionsOpen(false)
+        setToast({ text: `${day} の版に戻しました(Ctrl+Z で元に戻せます)` })
+      }} />}
       {ctx && <Dropdown at={{ x: ctx.x, y: ctx.y }} onClose={() => setCtx(null)} items={ctx.folder ? [
         { label: isFav(ctx.path) ? 'お気に入りから外す' : 'お気に入りにする', onClick: () => void toggleFav(ctx.path, 'folder') },
         { label: 'このフォルダに新しく作る', onClick: () => openNewNote('', ctx.path) },

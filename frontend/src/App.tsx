@@ -7,8 +7,8 @@ import { AlertTriangle, Check, ChevronRight, CircleDot, CloudOff, FilePlus2, Has
 import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode } from './livePreview'
-import { workspaceCompletions } from './completions'
-import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree } from './components'
+import { slashSource, workspaceCompletions } from './completions'
+import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, useKeyboardInset } from './components'
 import { applyChanges, cleanName, inMemoFolder, makeTask, MEMO_FOLDER, nameFromBody, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
 import { uuid } from './uuid'
 
@@ -428,11 +428,27 @@ export default function App() {
       setToast({ text: `まだ残せていません: ${(e as ApiError).message}(書いた内容は欄に残っています)` })
       return
     }
-    setCapture('')
-    store('capture.text', '')
+    clearCapture()
     setCaptureTask(false)
     await loadTree()
     setToast({ text: `「${name}」を残しました`, action: '開く', onAction: () => void openNote(path) })
+  }
+
+  // すぐ書く欄を空にする(エディタの中身も直接消す。状態だけ空にしてもエディタには残るため)
+  const clearCapture = () => {
+    const view = captureRef.current?.view
+    if (view && view.state.doc.length) view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: '' } })
+    setCapture('')
+    store('capture.text', '')
+  }
+  // 長くなってきたら: 書いた中身をそのまま大きな画面に移す(そこで めも に作られる)
+  const expandCapture = () => {
+    const body = capture
+    if (!body.trim()) return
+    clearCapture()
+    startDraft(memoFolder(), captureTask ? 'task' : 'memo', { body, title: '' })
+    setCaptureTask(false)
+    setTimeout(() => void createFromDraftRef.current(), 400)
   }
 
   // ホームのタスク: 開かずにチェックして完了にする(そのノートを開いていればエディタから)
@@ -482,7 +498,7 @@ export default function App() {
   const [showCommands, setShowCommands] = useState(false)
   const [commandIndex, setCommandIndex] = useState(0)
   const [menuKind, setMenuKind] = useState<'slash' | 'block'>('slash')
-  const [menuPos, setMenuPos] = useState({ top: 0, left: 0 })
+  const [menuPos, setMenuPos] = useState({ top: 0, left: 0, height: 340 })
   const wrapRef = useRef<HTMLDivElement>(null)
   const menuLineRef = useRef(-1)
   const enterRef = useRef(false)
@@ -522,8 +538,16 @@ export default function App() {
   const openMenu = (view: EditorView, kind: 'slash' | 'block') => {
     const head = view.state.selection.main.head
     const at = view.coordsAtPos(head)
-    const box = wrapRef.current?.getBoundingClientRect()
-    if (at && box) setMenuPos({ top: at.bottom - box.top + 6, left: Math.max(0, Math.min(at.left - box.left, box.width - 290)) })
+    // 画面からはみ出さない場所に出す: 下に場所が無ければカーソルの上、左右も画面の中に(スマホは下の操作列に出す)
+    if (at) {
+      const H = 340
+      const W = 290
+      const below = window.innerHeight - at.bottom - 12
+      const above = at.top - 12
+      const up = below < Math.min(H, 220) && above > below
+      const height = Math.min(H, Math.max(160, up ? above : below))
+      setMenuPos({ top: up ? at.top - 6 - height : at.bottom + 6, left: Math.max(8, Math.min(at.left, window.innerWidth - W - 8)), height })
+    }
     menuLineRef.current = view.state.doc.lineAt(head).number
     setMenuKind(kind)
     setCommandIndex(kind === 'slash' ? 0 : -1)
@@ -560,14 +584,43 @@ export default function App() {
     { key: 'Escape', run: () => { if (!menuRef.current.open) return false; setShowCommands(false); return true } },
   ])), [])
   const completions = useMemo(() => workspaceCompletions(() => notesRef.current, () => tagsRef.current), [])
+  // どのエディタで書いているか(スマホの操作列をそのエディタに効かせる)
+  const [focusView, setFocusView] = useState<EditorView | null>(null)
+  const focusExt = useMemo(() => EditorView.updateListener.of((u) => {
+    if (!u.focusChanged) return
+    if (u.view.hasFocus) setFocusView(u.view)
+    else setTimeout(() => setFocusView((v) => (v === u.view && !u.view.hasFocus ? null : v)), 120)
+  }), [])
+  const inset = useKeyboardInset()
+  // ホームのすぐ書く欄も、本文と同じ書き方(# で見出し、- で点、[[ リンク、# タグ、/ で候補)
+  const captureRef = useRef<ReactCodeMirrorRef>(null)
+  const saveCaptureRef = useRef<() => Promise<void>>(async () => {})
+  const captureExt = useMemo(() => [
+    markdown({ base: markdownLanguage }),
+    EditorView.lineWrapping,
+    Prec.highest(keymap.of([{ key: 'Mod-Enter', run: () => { void saveCaptureRef.current(); return true } }])),
+    workspaceCompletions(() => notesRef.current, () => tagsRef.current, [slashSource(commands)]),
+    livePreview('obsidian', (k, t) => linkRef.current(k, t)),
+    focusExt,
+  ], [focusExt])
+  saveCaptureRef.current = saveCapture
   const extensions = useMemo(() => [
     markdown({ base: markdownLanguage }),
     EditorView.lineWrapping,
     commandKeys,
     menuListener,
     completions,
+    focusExt,
     livePreview(presentation, (k, t) => linkRef.current(k, t)),
-  ], [presentation, commandKeys, menuListener, completions])
+  ], [presentation, commandKeys, menuListener, completions, focusExt])
+
+  // パソコン: ページを動かしたら候補は閉じる(カーソルから離れた所に残らないように)
+  useEffect(() => {
+    if (!showCommands || isMobile()) return
+    const close = () => setShowCommands(false)
+    window.addEventListener('scroll', close, { passive: true })
+    return () => window.removeEventListener('scroll', close)
+  }, [showCommands])
 
   const choosePresentation = (p: Presentation) => {
     setPresentation(p)
@@ -870,9 +923,10 @@ export default function App() {
                   basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: presentation === 'source', autocompletion: false, searchKeymap: true }}
                   onChange={onEditorChange}
                   autoFocus={!doc.path}
+                  onCreateEditor={(view) => { if (!docPathRef.current && view.state.doc.length) view.dispatch({ selection: { anchor: view.state.doc.length } }) }}
                   placeholder={draft ? '思いついたことを書く…(タイトルは書かなくてもいい)' : presentation === 'notion' ? '書きはじめる…(改行すると見出し・リストなどを選べる)' : '書きはじめる…   / で見出しやリスト、[[ でリンク'}
                 />
-                {showCommands && <div className="command-menu" style={{ top: menuPos.top, left: menuPos.left }}>
+                {showCommands && !isMobile() && <div className="command-menu" style={{ top: menuPos.top, left: menuPos.left, maxHeight: menuPos.height }}>
                   <div className="command-heading">{menuKind === 'block' ? 'ブロックにする' : '挿入'} <span>↑↓ · Enter · Esc</span></div>
                   {commands.map((cmd, i) => <button key={cmd.label} className={i === commandIndex ? 'selected' : ''} onMouseMove={() => setCommandIndex(i)} onMouseDown={(e) => e.preventDefault()} onClick={() => applyBlock(cmd.hint)}><span className="command-icon">{cmd.icon}</span><span>{cmd.label}</span><small>{cmd.hint ? cmd.hint.replaceAll('\n', ' ↵ ') : '記号なし'}</small></button>)}
                 </div>}
@@ -883,16 +937,21 @@ export default function App() {
             <p className="home-date">{new Date().toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' })}</p>
             <h1 className="home-hello">{greeting()}</h1>
             <div className="capture">
-              <textarea
-                value={capture}
-                onChange={(e) => { setCapture(e.target.value); store('capture.text', e.target.value) }}
-                placeholder="思いついたことを書く…"
-                rows={3}
-                onKeyDown={(e) => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.nativeEvent.isComposing) { e.preventDefault(); void saveCapture() } }}
-                aria-label="すぐ書く"
-              />
+              <div className="capture-editor mode-obsidian" aria-label="すぐ書く">
+                <CodeMirror
+                  ref={captureRef}
+                  value={capture}
+                  minHeight="96px"
+                  extensions={captureExt}
+                  theme="light"
+                  basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: false, autocompletion: false, searchKeymap: false }}
+                  onChange={(v) => { setCapture(v); store('capture.text', v) }}
+                  placeholder="思いついたことを書く…  (# 見出し・- 点・/ 候補もそのまま使えます)"
+                />
+              </div>
               <div className="capture-bar">
                 <button className={`chip ${captureTask ? 'on' : ''}`} onClick={() => setCaptureTask((v) => !v)}><ListChecks size={14} /> 今日のタスク</button>
+                <button className={`chip ${capture.split('\n').length > 6 ? 'on' : ''}`} onClick={expandCapture} disabled={!capture.trim()} title="大きな画面に移して続きを書く">広げて書く ↗</button>
                 <span className="capture-hint">Ctrl+Enter で残す · 名前は書き出しから付きます</span>
                 <button className="btn primary" disabled={!capture.trim()} onClick={() => void saveCapture()}>めもに残す</button>
               </div>
@@ -967,6 +1026,14 @@ export default function App() {
       />}
       {trashOpen && <TrashDialog onClose={() => setTrashOpen(false)} onRestore={async (it) => { const err = await restoreNote(it); if (!err) setTrashOpen(false); return err }} />}
       {toast && <Toast text={toast.text} action={toast.action} onAction={toast.onAction} onClose={() => setToast(null)} />}
+      {isMobile() && (focusView || (showCommands && editorRef.current?.view)) && <MobileBar
+        view={showCommands ? editorRef.current?.view ?? null : focusView}
+        inset={inset}
+        commands={commands}
+        menu={showCommands && focusView === editorRef.current?.view}
+        onPick={(hint) => applyBlock(hint)}
+        onClose={() => setShowCommands(false)}
+      />}
     </div>
   )
 }

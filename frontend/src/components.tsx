@@ -1,7 +1,11 @@
 // 画面の部品: フォルダの木・クイック検索・新しいノート・差分・メニュー
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { CheckSquare, ChevronRight, FileText, Folder, FolderOpen, Search, Square, X } from 'lucide-react'
+import type { EditorView as CMView } from '@codemirror/view'
+import { undo } from '@codemirror/commands'
+import { startCompletion } from '@codemirror/autocomplete'
 import { api, Note, SearchHit } from './api'
+import { applyBlockAt } from './completions'
 import { addProps, Change, MEMO_FOLDER, parseFront, setProp, setTags, SortName, sortNotes, tagLine, today } from './memo'
 
 // ---- フォルダの木 ----
@@ -438,6 +442,65 @@ export function Toast({ text, action, onAction, onClose }: { text: string; actio
       <span>{text}</span>
       {action && <button onClick={() => { onAction?.(); onClose() }}>{action}</button>}
       <button className="icon-button tiny" onClick={onClose} aria-label="閉じる"><X size={14} /></button>
+    </div>
+  )
+}
+
+// ---- スマホ: 書いているあいだ、キーボードの真上に出す操作列。Notion表示・/ の候補もここに出す(画面の外に消えない) ----
+
+
+// キーボードの高さ(画面の下からどれだけ隠れているか)
+export function useKeyboardInset() {
+  const [inset, setInset] = useState(0)
+  useEffect(() => {
+    const vv = window.visualViewport
+    if (!vv) return
+    const update = () => setInset(Math.max(0, Math.round(window.innerHeight - (vv.height + vv.offsetTop))))
+    update()
+    vv.addEventListener('resize', update)
+    vv.addEventListener('scroll', update)
+    return () => { vv.removeEventListener('resize', update); vv.removeEventListener('scroll', update) }
+  }, [])
+  return inset
+}
+
+export type BlockCmd = { label: string; hint: string; icon: string }
+
+export function MobileBar({ view, inset, commands, menu, onPick, onClose }: {
+  view: CMView | null
+  inset: number
+  commands: BlockCmd[]
+  menu: boolean // Notion表示の改行・/ の候補を出しているとき(全部の種類を出す)
+  onPick: (hint: string) => void
+  onClose: () => void
+}) {
+  if (!view) return null
+  const keep = (e: React.MouseEvent | React.PointerEvent) => e.preventDefault() // 押してもキーボードを閉じない
+  const block = (hint: string) => {
+    if (menu) { onPick(hint); return }
+    const pos = view.state.selection.main.head
+    applyBlockAt(view, hint, pos, pos)
+    view.focus()
+  }
+  const insert = (text: string, complete = false) => {
+    const { from, to } = view.state.selection.main
+    view.dispatch({ changes: { from, to, insert: text }, selection: { anchor: from + text.length }, userEvent: 'input.type' })
+    view.focus()
+    if (complete) startCompletion(view)
+  }
+  const quick = menu ? commands : commands.filter((c) => ['見出し 2', '箇条書き', 'チェックリスト', '番号付きリスト', '引用'].includes(c.label))
+  return (
+    <div className={`mobile-bar ${menu ? 'menu' : ''}`} style={{ bottom: inset }} onPointerDown={keep} onMouseDown={keep}>
+      {menu && <span className="mobile-bar-label">ブロックにする</span>}
+      <div className="mobile-bar-scroll">
+        {quick.map((c) => <button key={c.label} onClick={() => block(c.hint)} aria-label={c.label}><b>{c.icon}</b>{menu && <small>{c.label}</small>}</button>)}
+        {!menu && <>
+          <button onClick={() => insert('[[', true)} aria-label="リンク"><b>[[</b></button>
+          <button onClick={() => insert('#', false)} aria-label="タグ"><b>#</b></button>
+          <button onClick={() => { undo(view); view.focus() }} aria-label="元に戻す"><b>↶</b></button>
+        </>}
+      </div>
+      <button className="mobile-bar-close" onClick={() => (menu ? onClose() : view.contentDOM.blur())} aria-label={menu ? '候補を閉じる' : 'キーボードを閉じる'}>{menu ? '×' : '⌄'}</button>
     </div>
   )
 }

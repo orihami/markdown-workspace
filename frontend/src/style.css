@@ -347,3 +347,46 @@ input.document-title:focus { color: var(--ink); }
   .card { min-height: 0; }
 }
 .capture-bar .btn { margin-left: auto; }
+
+/* 候補は画面に対して置く(カーソルの下か上。はみ出さない) */
+.command-menu { position: fixed; }
+
+/* ホームのすぐ書く欄(本文と同じエディタ) */
+.capture-editor { padding: 10px 14px 4px; }
+.capture-editor .cm-editor { font-size: 17px; }
+.capture-editor .cm-scroller { line-height: 1.8 !important; }
+.capture-editor .cm-content { padding: 2px 0 !important; }
+.capture-bar .chip:disabled { opacity: 0.45; cursor: default; }
+
+/* スマホ: キーボードの真上の操作列 */
+.mobile-bar { position: fixed; left: 0; right: 0; z-index: 25; display: flex; align-items: center; gap: 4px; padding: 6px 6px calc(6px + env(safe-area-inset-bottom)); background: rgba(255, 255, 255, 0.97); border-top: 1px solid var(--line); box-shadow: 0 -6px 20px rgba(35, 33, 29, 0.06); backdrop-filter: blur(8px); }
+.mobile-bar-scroll { flex: 1; display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; }
+.mobile-bar-scroll::-webkit-scrollbar { display: none; }
+.mobile-bar button { flex-shrink: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; min-width: 42px; height: 40px; padding: 0 8px; border: 0; border-radius: 10px; background: var(--side); color: var(--ink); cursor: pointer; touch-action: manipulation; }
+.mobile-bar button b { font-size: 15px; font-weight: 600; line-height: 1; }
+.mobile-bar button small { font-size: 10px; color: var(--muted); }
+.mobile-bar button:active { background: var(--side-2); }
+.mobile-bar.menu { flex-wrap: wrap; }
+.mobile-bar.menu button { height: 48px; min-width: 64px; }
+.mobile-bar-label { flex-basis: 100%; font-size: 11px; font-weight: 700; color: var(--muted); padding: 0 4px 2px; }
+.mobile-bar-close { background: transparent !important; color: var(--muted) !important; font-size: 20px; min-width: 36px !important; }
+
+/* スマホで書くときの見た目 */
+@media (max-width: 760px) {
+  .topline { height: 44px; }
+  .topline .breadcrumbs { display: none; }
+  .top-tools .tool:not(.icon) svg + * { font-size: 12px; }
+  .document { padding: 8px 20px 160px; }
+  .document-title, input.document-title { font-size: 24px; line-height: 1.35; }
+  .title-check { width: 22px; height: 22px; margin-top: 5px; }
+  .meta { margin: 6px 0 14px; }
+  .cm-editor { font-size: 16.5px; }
+  .cm-scroller { line-height: 1.85 !important; }
+  .cm-lp-h1 { font-size: 1.5em; }
+  .cm-lp-h2 { font-size: 1.28em; }
+  .cm-lp-h3 { font-size: 1.12em; }
+  .cm-lp-code { font-size: 13px; padding-left: 12px !important; padding-right: 12px !important; }
+  .cm-lp-quote { padding-left: 12px !important; }
+  .capture-editor .cm-editor { font-size: 16.5px; }
+  .capture-bar { flex-wrap: wrap; row-gap: 6px; }
+}

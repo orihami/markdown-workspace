@@ -1,16 +1,20 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 ; どこからでも1秒メモ: ko-pi の Markdown Workspace の「めも」に残す
-;   Ctrl+Alt+M … メモ窓を出す
+;   Ctrl+Alt+(物理的な M の位置) … メモ窓を出す(memo-quick.ini の hotkey= で変えられる)
 ;   Ctrl+Enter … めも に残す(名前は書き出しから。date 付き)
 ;   Esc        … 閉じる(書いた分は窓に残る)
 ; 送り先は同じフォルダの memo-quick.ini に書く(リポジトリには入れない):
 ;   [memo]
 ;   server=https://ko-pi.<tailnet>.ts.net:8443
+;   hotkey=^!sc032
+; hotkey は AutoHotkey の書き方。^=Ctrl !=Alt +=Shift #=Win。キー配列を変えていても位置で決まるよう、
+; 文字ではなくスキャンコード(sc032 = 物理的な M の位置、sc039 = スペース など)を使う。例: ^!sc039、#+sc032、^!F12
 ; Windows を起動したら動くようにするには、このファイルのショートカットを shell:startup に置く
 
 iniPath := A_ScriptDir "\memo-quick.ini"
 server := RTrim(IniRead(iniPath, "memo", "server", ""), "/")
+memoKey := Trim(IniRead(iniPath, "memo", "hotkey", "^!sc032"))
 
 memoGui := Gui("+AlwaysOnTop -MinimizeBox", "memo")
 memoGui.SetFont("s11", "Yu Gothic UI")
@@ -22,14 +26,19 @@ memoStatus := memoGui.AddText("x+16 yp w260 cGray", "Ctrl+Enter で残す")
 memoGui.OnEvent("Escape", (*) => memoGui.Hide())
 memoGui.OnEvent("Close", (*) => memoGui.Hide())
 
-^!m:: {
+ShowMemo(*) {
     memoStatus.Text := "Ctrl+Enter で残す"
     memoGui.Show("AutoSize")
     memoEdit.Focus()
 }
+try
+    Hotkey(memoKey, ShowMemo)
+catch
+    MsgBox("memo-quick.ini の hotkey=" memoKey " が使えません。書き方を確かめてください", "memo")
 
+; 残す: Ctrl+Enter(Enter は位置が変わりにくいので sc01C で決める)
 #HotIf WinActive("ahk_id " memoGui.Hwnd)
-^Enter:: SendMemo()
+^sc01C:: SendMemo()
 #HotIf
 
 SendMemo() {

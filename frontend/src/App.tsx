@@ -81,6 +81,9 @@ export default function App() {
   // 自動で整えたメモ(ホームに出して、元に戻せる)
   const [auto, setAuto] = useState<{ enabled: boolean; items: { id: number; path_before: string; path: string; tags: string[]; tasks: string[]; at: string; undone: boolean }[] }>({ enabled: true, items: [] })
   const [indexInfo, setIndexInfo] = useState<{ notes: number; chunks: number; updated_at: string | null } | null>(null)
+  const [autoOpen, setAutoOpen] = useState(false)
+  const autoRecent = auto.items.filter((a) => !a.undone && Date.now() - new Date(a.at).getTime() < 3 * 86400000).slice(0, 8)
+  const autoUnseen = autoRecent.filter((a) => a.id > Number(load('auto.seen', '0'))).length
   const loadAuto = useCallback(() => { api<typeof auto>('/api/ai/auto').then(setAuto).catch(() => {}) }, [])
   useEffect(() => {
     api<{ enabled: boolean; spent_yen: number; monthly_yen: number }>('/api/ai/status').then((r) => { setAiOn(r.enabled); setAiSpent({ spent: r.spent_yen, cap: r.monthly_yen }); if (r.enabled) loadAuto() }).catch(() => setAiOn(false))
@@ -1078,19 +1081,6 @@ export default function App() {
               <AskPanel question={asked} notes={notes} onOpen={(p) => void openNote(p)} />
             </div>}
             {apiOk === false && <p className="home-empty">サーバーにつながりません。つながると一覧が出ます。</p>}
-            {auto.items.some((a) => !a.undone && Date.now() - new Date(a.at).getTime() < 3 * 86400000) && <section className="home-sec">
-              <h2>AI が整えたメモ</h2>
-              <div className="auto-list">
-                {auto.items.filter((a) => !a.undone && Date.now() - new Date(a.at).getTime() < 3 * 86400000).slice(0, 5).map((a) => (
-                  <div key={a.id} className="auto-row">
-                    <button className="auto-name" onClick={() => void openNote(a.path)}>{nameOf(a.path)}</button>
-                    <small>{a.path !== a.path_before ? `名前を変えた(元: ${nameOf(a.path_before)}) · ` : ''}{a.tags.map((t) => '#' + t).join(' ')}{a.tasks.length ? ` · タスク ${a.tasks.length}件: ${a.tasks.map(nameOf).join('・')}` : ''}</small>
-                    <button className="btn tiny" onClick={() => void undoAuto(a.id)}>元に戻す</button>
-                  </div>
-                ))}
-              </div>
-            </section>}
-
             {(todayTasks.length > 0 || upcoming.length > 0) && <section className="home-sec">
               <div className="sec-head"><h2>タスク</h2>{todayTasks.some((n) => n.task_day! < today()) && <button className="chip" onClick={() => void moveOverdue()}>期限切れ {todayTasks.filter((n) => n.task_day! < today()).length}件を今日に</button>}</div>
               <div className="task-list">
@@ -1124,6 +1114,19 @@ export default function App() {
                 </button>
               ))}</div>
             </section>}
+            {/* AI が自動で整えたメモ: いちばん下に小さく1行。押したときだけ開く。見たら消える */}
+            {autoRecent.length > 0 && <div className={`auto-bar ${autoOpen ? 'open' : ''}`}>
+              <button className="auto-bar-head" onClick={() => { setAutoOpen((v) => !v); store('auto.seen', String(autoRecent[0].id)) }} aria-expanded={autoOpen}>
+                <Sparkles size={13} /><span>AI が {autoRecent.length}件 整えました</span>{autoUnseen > 0 && <em>新しく {autoUnseen}件</em>}<ChevronRight size={13} className={`chev ${autoOpen ? 'open' : ''}`} />
+              </button>
+              {autoOpen && autoRecent.map((a) => (
+                <div key={a.id} className="auto-row">
+                  <button className="auto-name" onClick={() => void openNote(a.path)} title={nameOf(a.path)}>{nameOf(a.path)}</button>
+                  <small title={`${a.tags.map((t) => '#' + t).join(' ')}${a.tasks.length ? ` / タスク: ${a.tasks.map(nameOf).join('・')}` : ''}`}>{a.path !== a.path_before ? '名前・' : ''}{a.tags.length ? `タグ${a.tags.length}` : ''}{a.tasks.length ? `・タスク${a.tasks.length}` : ''}</small>
+                  <button className="auto-undo" onClick={() => void undoAuto(a.id)}>元に戻す</button>
+                </div>
+              ))}
+            </div>}
             <div className="home-more">
               <button className="btn" onClick={() => openNewNote()}><FilePlus2 size={15} /> 広い画面で書く</button>
               <button className="btn" onClick={() => setSwitcher('')}><Search size={15} /> 探す</button>

@@ -336,6 +336,7 @@ try {
   await page.click('.capture button:has-text("広げて書く")')
   await page.waitForSelector('input.document-title')
   check(await waitFor(() => existsSync(join(vault, 'めも', 'りんご.md')), 15000) && read('めも/りんご.md').includes('- りんご\n- みかん\n') && read('めも/りんご.md').includes('買うもの'), '「広げて書く」で、書いた中身のまま大きな画面に移り、めも に作る')
+  await page.waitForFunction(() => decodeURIComponent(location.hash).includes('りんご'))
   await page.goto(base + '/#/')
   await page.reload()
   await page.waitForSelector('.task-row:has-text("タスクA")')
@@ -438,6 +439,23 @@ try {
   // Windows のキー1つのメモ(AutoHotkey)が使う /api/capture
   const cr = await fetch(base + '/api/capture', { method: 'POST', headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify({ text: 'パソコンから一言\n続き', task: false }) })
   check(cr.ok && read('めも/パソコンから一言.md') === `---\ndate: '${T}'\n---\n\nパソコンから一言\n続き\n`, 'キー1つのメモ: 送った文が、書き出しの名前で めも に残る')
+  // ✨ 整える(AI はテストでは決まった答えを返す偽物にする): 選んだものだけ当てる
+  await page.route('**/api/ai/status', (r) => r.fulfill({ json: { enabled: true, spent_yen: 0, monthly_yen: 300 } }))
+  await page.route('**/api/ai/tidy', (r) => r.fulfill({ json: { title: '一言メモ', tags: ['学校', 'AI'], new_tags: ['AI'], tasks: [{ text: 'レポートを出す', due: dayAfter(2) }, { text: '要らないタスク', due: null }], summary: '要約です', spent_yen: 0.6 } }))
+  await page.goto(base + '/#/' + encodeURI('めも/パソコンから一言.md'))
+  await page.reload()
+  await page.waitForSelector('.tool:has-text("整える")')
+  await page.click('.tool:has-text("整える")')
+  await page.waitForSelector('.tidy .tidy-task')
+  await page.locator('.tidy .tidy-task').nth(1).locator('input[type="checkbox"]').uncheck()
+  await page.locator('.tidy label.tidy-row:has-text("要約")').locator('input').check()
+  await page.click('.tidy button:has-text("選んだものを当てる")')
+  check(await waitFor(() => existsSync(join(vault, 'めも', '一言メモ.md')) && !existsSync(join(vault, 'めも', 'パソコンから一言.md')), 15000), '整える: 提案の名前に変わる')
+  const tidied = read('めも/一言メモ.md')
+  check(tidied.includes('#学校 #AI') && tidied.includes('> 要約: 要約です') && tidied.includes('パソコンから一言\n続き'), '整える: タグはきまりの位置に、要約は本文の頭に。本文はそのまま')
+  check(existsSync(join(vault, 'めも', 'レポートを出す.md')) && read('めも/レポートを出す.md').includes(`遂行日: ${dayAfter(2)}`) && read('めも/レポートを出す.md').includes('元のメモ: [[一言メモ]]') && !existsSync(join(vault, 'めも', '要らないタスク.md')), '整える: 選んだ課題だけ、期限つきのタスクとして作り、新しい名前のメモへリンクする')
+  await page.unroute('**/api/ai/status')
+  await page.unroute('**/api/ai/tidy')
   await page.screenshot({ path: join(work, 'desktop.png') })
 
   // スマホ幅: 一覧は閉じていて、開いてノートを選ぶと閉じる
@@ -466,6 +484,9 @@ try {
   check(errors.length === 0, `ブラウザのエラーなし ${errors.slice(0, 3).join(' / ')}`)
 } catch (e) {
   console.error(e)
+  // 失敗したときの画面を残す
+  for (const [i, pg] of browser.contexts().flatMap((c) => c.pages()).entries()) await pg.screenshot({ path: join(work, `fail-${i}.png`) }).catch(() => {})
+  console.log('失敗時の画面: ' + work)
   failed = true
 } finally {
   await browser.close()

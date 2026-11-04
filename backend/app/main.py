@@ -13,6 +13,8 @@ from typing import Optional
 from uuid import UUID
 
 from dotenv import load_dotenv
+
+from . import ai
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -918,6 +920,75 @@ async def share_target(title: str = Form(""), text: str = Form(""), url: str = F
     name_title = title.strip() if title.strip() and title.strip() not in text else ""
     path = create_memo("\n\n".join(lines) or title.strip(), title=name_title)
     return RedirectResponse("/#/" + "/".join(p for p in path.split("/")), status_code=303)
+
+
+# ---- AI(雑記を整える など)。博士の Gemini の鍵を使い、月の上限を守る ----
+
+WEEK_JA = "月火水木金土日"
+
+TIDY_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "title": {"type": "STRING"},
+        "tags": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "tasks": {"type": "ARRAY", "items": {"type": "OBJECT", "properties": {"text": {"type": "STRING"}, "due": {"type": "STRING", "nullable": True}}, "required": ["text"]}},
+        "summary": {"type": "STRING"},
+    },
+    "required": ["title", "tags", "tasks", "summary"],
+}
+
+TIDY_SYSTEM = """あなたは大学生のメモ帳の整理係です。授業中のメモ、課題のメモ、課題の情報集め、下書き、思いつきの雑記が入ってきます。
+書かれていないことを足さない。推測で事実を作らない。日本語で答える。"""
+
+
+class TidyRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=400)
+    content: Optional[str] = None  # 画面にある最新の内容(保存の前でも使えるように)
+
+
+@app.get("/api/ai/status", dependencies=[Depends(require_auth)])
+def ai_status():
+    return {"enabled": ai.api_key() is not None, "spent_yen": round(ai.spent_yen(db), 2), "monthly_yen": ai.MONTHLY_YEN}
+
+
+@app.post("/api/ai/tidy", dependencies=[Depends(require_auth)])
+def ai_tidy(body: TidyRequest):
+    """雑記を整える提案: 名前・タグ(いまあるタグから)・課題/やることと期限・要約。ファイルは変えない(当てるのは画面で選んでから)"""
+    path = safe_note_path(body.path, must_exist=body.content is None)
+    text = body.content if body.content is not None else path.read_text(encoding="utf-8")
+    now = datetime.now().astimezone()
+    known = [i["tag"] for i in tags()["items"]][:150]
+    current_name = Path(body.path).stem
+    prompt = f"""今日は {now.strftime('%Y-%m-%d')}({WEEK_JA[now.weekday()]}曜)です。次のメモを整えるための提案を JSON で返してください。
+
+- title: 中身がひと目で分かる名前。24文字くらいまで。いまの名前「{current_name}」がよければそのまま。ファイル名に使えない記号 \\ / : * ? " < > | # ^ [ ] は使わない
+- tags: いまあるタグの中から合うものを最大4つ。どうしても合うものが無いときだけ、新しいタグを1つまで。# は付けない。いまあるタグ: {', '.join(known)}
+- tasks: メモの中にある「やること・課題・提出物・締切・予定」だけ。無ければ空。text は短く(「〇〇のレポートを出す」など)。due は日付が書いてあれば YYYY-MM-DD(「来週水曜」なども今日から数える)、無ければ null
+- summary: 1〜2文の要約
+
+メモ:
+<<<
+{text[:12000]}
+>>>"""
+    try:
+        out = ai.generate_json(prompt, TIDY_SCHEMA, db, system=TIDY_SYSTEM)
+    except ai.AIError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    title = cleanup_name(str(out.get("title") or ""))[:40]
+    tag_list = []
+    for t in out.get("tags") or []:
+        t = re.sub(r"\s+", "", str(t)).lstrip("#")
+        if t and not t.replace("/", "").isdigit() and t not in tag_list:
+            tag_list.append(t)
+    tasks_out = []
+    for t in out.get("tasks") or []:
+        due = t.get("due") if isinstance(t, dict) else None
+        if due and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(due)):
+            due = None
+        text_t = str(t.get("text") or "").strip() if isinstance(t, dict) else ""
+        if text_t:
+            tasks_out.append({"text": text_t[:80], "due": due})
+    return {"title": title, "tags": tag_list[:5], "new_tags": [t for t in tag_list if t not in known], "tasks": tasks_out[:10], "summary": str(out.get("summary") or "").strip()[:300], "spent_yen": round(ai.spent_yen(db), 2)}
 
 
 # ---- お気に入り(どの端末からも同じ。Vault のファイルや Obsidian の設定には書かない) ----

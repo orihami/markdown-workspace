@@ -3,13 +3,13 @@ import CodeMirror, { ReactCodeMirrorRef } from '@uiw/react-codemirror'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorView, keymap } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
-import { AlertTriangle, Check, ChevronRight, CircleDot, CloudOff, FilePlus2, Hash, ListChecks, Loader2, Menu, MoreHorizontal, Plus, Search, Settings2, Star, Trash2, Wifi, WifiOff, X } from 'lucide-react'
+import { AlertTriangle, Check, ChevronRight, Sparkles, CircleDot, CloudOff, FilePlus2, Hash, ListChecks, Loader2, Menu, MoreHorizontal, Plus, Search, Settings2, Star, Trash2, Wifi, WifiOff, X } from 'lucide-react'
 import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode, pasteImages } from './livePreview'
 import { slashSource, workspaceCompletions } from './completions'
-import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, useKeyboardInset, VersionsDialog } from './components'
-import { applyChanges, Change, cleanName, inMemoFolder, makeTask, removeProp, MEMO_FOLDER, nameFromBody, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
+import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, TidyApply, TidyDialog, useKeyboardInset, VersionsDialog } from './components'
+import { applyChanges, Change, cleanName, inMemoFolder, makeTask, removeProp, setTags as setTagLine, tagLine, MEMO_FOLDER, nameFromBody, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
 import { uuid } from './uuid'
 import { findDate, nextOccurrence, REPEATS, shortDay, TASK_WORDS } from './jdate'
 
@@ -71,6 +71,9 @@ export default function App() {
   const [settings, setSettings] = useState(false)
   const [diff, setDiff] = useState<{ mine: string; server: string } | null>(null)
   const [versionsOpen, setVersionsOpen] = useState(false)
+  const [tidyOpen, setTidyOpen] = useState(false)
+  const [aiOn, setAiOn] = useState(false)
+  useEffect(() => { api<{ enabled: boolean }>('/api/ai/status').then((r) => setAiOn(r.enabled)).catch(() => setAiOn(false)) }, [])
   const [notice, setNotice] = useState('')
   const [vaultName, setVaultName] = useState(() => load('obsidian.vault', 'OMNI'))
   // 並べ替え(OMNIメモアプリと同じ種類。めもの sortspec と同じ「日付が新しい順」が最初)
@@ -452,6 +455,39 @@ export default function App() {
     startDraft(memoFolder(), captureTask ? 'task' : 'memo', { body, title: '' })
     setCaptureTask(false)
     setTimeout(() => void createFromDraftRef.current(), 400)
+  }
+
+  // ✨ 整える の提案を当てる: タグ → 要約 → 課題をタスクとして作る → 名前(最後。保存が終わってから)
+  const applyTidy = async (a: TidyApply) => {
+    const path = docPathRef.current
+    if (!path) return
+    if (a.tags.length) {
+      const cur = tagLine(contentRef.current)?.tags ?? []
+      editHead(setTagLine(contentRef.current, [...cur, ...a.tags.filter((t) => !cur.includes(t))]))
+    }
+    if (a.summary) {
+      const h = headOf(contentRef.current)
+      const at = Math.max(0, h.length - (contentRef.current.length > h.length - 1 && h.length ? 1 : 0))
+      editHead([{ from: at, insert: `> 要約: ${a.summary}\n\n` }])
+    }
+    // 名前を変えるなら、タスクのリンクは新しい名前に向ける
+    const finalName = a.title ? uniqueName(folderOf(path), cleanName(a.title), path) : nameOf(path)
+    const made: string[] = []
+    for (const t of a.tasks) {
+      const p = await createNamed(t.text, memoFolder(), '')
+      if (!p) continue
+      // タスクの書式(遂行日・完了・date)で作り直し、元のメモへのリンクを付ける
+      try {
+        const r = await api<NoteResponse>(notePath(p))
+        await api(notePath(p), { method: 'PUT', body: JSON.stringify({ content: newNoteContent('task', { day: t.due }) + `元のメモ: [[${finalName}]]\n`, base_etag: r.etag, mutation_id: uuid() }) })
+        made.push(nameOf(p))
+      } catch { /* 作れなかった分は知らせる */ }
+    }
+    if (a.title) await renameTo(path, finalName)
+    setTidyOpen(false)
+    void loadTree()
+    void loadTags()
+    setToast({ text: `整えました${made.length ? `(タスク ${made.length}件: ${made.join('・')})` : ''}` })
   }
 
   // タスクを開かずに書きかえる(そのノートを開いていればエディタから。そうでなければ読んで、変えて、保存する)
@@ -906,6 +942,7 @@ export default function App() {
               {sync && <button className={`save-indicator s-${sync.status}`} title={sync.message || STATUS_LABEL[sync.status]} onClick={() => engine.saveNow(active)} aria-live="polite">
                 {STATUS_ICON[sync.status]}<span>{STATUS_LABEL[sync.status]}</span>{pending > 1 && <em>+{pending - 1}</em>}
               </button>}
+              {doc && !draft && aiOn && <button className="tool" onClick={() => setTidyOpen(true)} title="AI が名前・タグ・課題と期限・要約を提案します(選んだものだけ当てる)"><Sparkles size={15} /> 整える</button>}
               {doc && !draft && <button className={`tool icon ${isFav(active) ? 'on' : ''}`} onClick={() => void toggleFav(active, 'note')} aria-label={isFav(active) ? 'お気に入りから外す' : 'お気に入りにする'} title={isFav(active) ? 'お気に入りから外す' : 'お気に入りにする'}><Star size={17} /></button>}
               {doc && !draft && <div className="menu-anchor">
                 <button className="tool icon" onClick={() => setNoteMenu((v) => !v)} aria-label="ノートのメニュー" aria-expanded={noteMenu}><MoreHorizontal size={18} /></button>
@@ -1063,6 +1100,7 @@ export default function App() {
 
       {switcher !== null && <QuickSwitcher notes={notes} initial={switcher} onClose={() => setSwitcher(null)} onOpen={(p) => { setSwitcher(null); void openNote(p) }} onCreate={(name) => openNewNote(name)} />}
       {diff && <DiffDialog mine={diff.mine} server={diff.server} onClose={() => setDiff(null)} />}
+      {tidyOpen && active && <TidyDialog path={active} content={contentRef.current} currentTags={tagLine(contentRef.current)?.tags ?? []} onClose={() => setTidyOpen(false)} onApply={applyTidy} />}
       {versionsOpen && active && <VersionsDialog path={active} current={contentRef.current} onClose={() => setVersionsOpen(false)} onRestore={(content, day) => {
         const view = editorRef.current?.view
         if (view) view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: content }, userEvent: 'input.restore' })

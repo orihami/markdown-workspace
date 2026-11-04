@@ -289,3 +289,25 @@ def test_capture_and_share(client, vault):
     assert r.status_code == 303 and "よい記事" in __import__("urllib.parse").parse.unquote(r.headers["location"])
     shared = (vault / "めも" / "よい記事.md").read_text(encoding="utf-8")
     assert "読みたい\n\nhttps://example.com/a\n\n![[Pasted image " in shared
+
+
+def test_ai_tidy_sanitizes_and_writes_nothing(client, vault, monkeypatch):
+    from app import ai
+    monkeypatch.setattr(ai, "api_key", lambda: "dummy")
+    monkeypatch.setattr(ai, "generate_json", lambda *a, **k: {"title": "名前/に:記号", "tags": ["#学校", "123", "新タグ", "学校"], "tasks": [{"text": "出す", "due": "来週"}, {"text": "読む", "due": "2026-11-11"}, {"text": ""}], "summary": "要約"})
+    before = (vault / "a.md").read_text(encoding="utf-8")
+    r = client.post("/api/ai/tidy", json={"path": "a.md"})
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert "/" not in j["title"] and ":" not in j["title"]
+    # テストの Vault にあるタグは x だけなので、学校 も 新タグ も「新しいタグ」
+    assert j["tags"] == ["学校", "新タグ"] and j["new_tags"] == ["学校", "新タグ"]
+    assert j["tasks"] == [{"text": "出す", "due": None}, {"text": "読む", "due": "2026-11-11"}]
+    assert (vault / "a.md").read_text(encoding="utf-8") == before
+
+
+def test_ai_disabled_without_key(client, vault, monkeypatch):
+    from app import ai
+    monkeypatch.setattr(ai, "KEY_FILE", None)
+    assert client.get("/api/ai/status").json()["enabled"] is False
+    assert client.post("/api/ai/tidy", json={"path": "a.md"}).status_code == 503

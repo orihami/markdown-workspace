@@ -554,3 +554,81 @@ export function VersionsDialog({ path, current, onRestore, onClose }: {
     </div>
   )
 }
+
+// ---- ✨ 整える(AI): 雑記から名前・タグ・課題/やること・要約を提案。選んだものだけ当てる(本文は書きかえない) ----
+
+export type TidyResult = { title: string; tags: string[]; new_tags: string[]; tasks: { text: string; due: string | null }[]; summary: string; spent_yen: number }
+export type TidyApply = { title: string | null; tags: string[]; tasks: { text: string; due: string }[]; summary: string | null }
+
+export function TidyDialog({ path, content, currentTags, onApply, onClose }: {
+  path: string
+  content: string
+  currentTags: string[]
+  onApply: (a: TidyApply) => Promise<void>
+  onClose: () => void
+}) {
+  const [res, setRes] = useState<TidyResult | null>(null)
+  const [error, setError] = useState('')
+  const [useTitle, setUseTitle] = useState(true)
+  const [pickTags, setPickTags] = useState<Set<string>>(new Set())
+  const [tasks, setTasks] = useState<{ text: string; due: string; on: boolean }[]>([])
+  const [useSummary, setUseSummary] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const name = path.split('/').pop()!.replace(/\.md$/i, '')
+  useEffect(() => {
+    api<TidyResult>('/api/ai/tidy', { method: 'POST', body: JSON.stringify({ path, content }) }, 60000)
+      .then((r) => {
+        setRes(r)
+        setUseTitle(!!r.title && r.title !== name)
+        setPickTags(new Set(r.tags.filter((t) => !currentTags.includes(t))))
+        setTasks(r.tasks.map((t) => ({ text: t.text, due: t.due || today(), on: true })))
+      })
+      .catch((e) => setError((e as Error).message))
+  }, [])
+  const apply = async () => {
+    if (!res) return
+    setBusy(true)
+    await onApply({
+      title: useTitle && res.title && res.title !== name ? res.title : null,
+      tags: [...pickTags],
+      tasks: tasks.filter((t) => t.on && t.text.trim()).map((t) => ({ text: t.text.trim(), due: t.due })),
+      summary: useSummary && res.summary ? res.summary : null,
+    })
+    setBusy(false)
+  }
+  const nothing = res && !(useTitle && res.title !== name) && !pickTags.size && !tasks.some((t) => t.on) && !useSummary
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="modal small tidy" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label="整える">
+        <div className="modal-head"><h2>✨ 整える</h2><button className="icon-button" onClick={onClose} aria-label="閉じる"><X size={16} /></button></div>
+        {!res && !error && <p className="delete-info"><span className="spinner inline" /> AI が読んでいます…</p>}
+        {error && <p className="field-error">{error}</p>}
+        {res && <>
+          {res.title && res.title !== name && <label className="tidy-row"><input type="checkbox" checked={useTitle} onChange={(e) => setUseTitle(e.target.checked)} /><span><small>名前</small>{name} → <b>{res.title}</b></span></label>}
+          {res.tags.length > 0 && <div className="tidy-row block"><small>タグ</small><div className="tidy-tags">
+            {res.tags.map((t) => {
+              const have = currentTags.includes(t)
+              return <button key={t} className={`chip ${pickTags.has(t) || have ? 'on' : ''}`} disabled={have} onClick={() => setPickTags((s) => { const n = new Set(s); if (n.has(t)) n.delete(t); else n.add(t); return n })}>#{t}{have ? ' (付いている)' : res.new_tags.includes(t) ? ' (新しいタグ)' : ''}</button>
+            })}
+          </div></div>}
+          {tasks.length > 0 && <div className="tidy-row block"><small>課題・やること(めもに別のタスクとして作り、このメモへのリンクを付けます)</small>
+            {tasks.map((t, i) => (
+              <div key={i} className="tidy-task">
+                <input type="checkbox" checked={t.on} onChange={(e) => setTasks((l) => l.map((x, k) => (k === i ? { ...x, on: e.target.checked } : x)))} aria-label="作る" />
+                <input className="tidy-task-text" value={t.text} onChange={(e) => setTasks((l) => l.map((x, k) => (k === i ? { ...x, text: e.target.value } : x)))} />
+                <input type="date" value={t.due} onChange={(e) => setTasks((l) => l.map((x, k) => (k === i ? { ...x, due: e.target.value || today() } : x)))} aria-label="遂行日" />
+              </div>
+            ))}
+          </div>}
+          {res.summary && <label className="tidy-row"><input type="checkbox" checked={useSummary} onChange={(e) => setUseSummary(e.target.checked)} /><span><small>要約を本文の頭に入れる</small>{res.summary}</span></label>}
+          {!res.tags.length && !tasks.length && res.title === name && <p className="delete-info">整えるところは見つかりませんでした。</p>}
+          <p className="tidy-cost">今月の AI: {res.spent_yen.toFixed(1)}円(上限あり)</p>
+        </>}
+        <div className="modal-actions">
+          <button className="btn" onClick={onClose}>やめる</button>
+          <button className="btn primary" disabled={!res || busy || !!nothing} onClick={() => void apply()}>{busy ? '当てています…' : '選んだものを当てる'}</button>
+        </div>
+      </div>
+    </div>
+  )
+}

@@ -417,3 +417,17 @@ input, textarea { caret-color: var(--accent); }
 .task-line .repeat select:hover { background: var(--side); color: var(--ink); }
 @media (hover: none) { .task-move { opacity: 1; } }
 @media (max-width: 760px) { .task-row { flex-wrap: wrap; } .task-move { flex-basis: 100%; padding-left: 28px; } }
+
+/* ✨ 整える */
+.tidy { max-width: 520px; }
+.tidy-row { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; border-top: 1px solid var(--line); font-size: 14px; line-height: 1.6; cursor: pointer; }
+.tidy-row.block { flex-direction: column; gap: 6px; cursor: default; }
+.tidy-row small { display: block; font-size: 11.5px; font-weight: 700; color: var(--muted); }
+.tidy-row input[type="checkbox"] { margin-top: 4px; accent-color: var(--accent); width: 16px; height: 16px; flex-shrink: 0; }
+.tidy-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.tidy-task { display: flex; align-items: center; gap: 8px; width: 100%; }
+.tidy-task input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
+.tidy-task-text { flex: 1; min-width: 0; font: inherit; font-size: 14px; border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; }
+.tidy-task input[type="date"] { font: inherit; font-size: 13px; border: 1px solid var(--line); border-radius: 7px; padding: 4px 6px; color: var(--ink-2); }
+.tidy-cost { margin: 4px 0 0; font-size: 11.5px; color: var(--faint); }
+.spinner.inline { display: inline-block; vertical-align: -3px; margin-right: 6px; }

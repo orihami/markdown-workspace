@@ -33,6 +33,8 @@ def api_key() -> str | None:
 
 def price(model: str) -> tuple[float, float]:
     """(入力, 出力) USD/100万トークン(博士の hakase_budget.py と同じ表。料金表に無いものは高めに)"""
+    if model.startswith("gemini-embedding"):
+        return (0.15, 0.0)
     if model.startswith("gemini-3.5-flash-lite"):
         return (0.30, 2.50)
     if model.startswith("gemini-3.1-flash-lite"):
@@ -88,6 +90,40 @@ def generate_json(prompt: str, schema: dict, db: Callable, system: str = "", tim
             last = f"{model}: 答えを読めませんでした"
             continue
     raise AIError(f"AI につながりませんでした({last})")
+
+
+EMBED_MODEL = os.getenv("AI_EMBED_MODEL", "gemini-embedding-001")
+EMBED_DIMS = 768
+
+
+def embed(texts: list[str], db: Callable, task: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
+    """文を意味のベクトルにする(メモを探すための索引用)。100件ずつ送る"""
+    key = api_key()
+    if not key:
+        raise AIError("AI の鍵が見つかりません")
+    if spent_yen(db) >= MONTHLY_YEN:
+        raise AIError(f"今月の AI の上限({MONTHLY_YEN:.0f}円)に達しました", status=429)
+    out: list[list[float]] = []
+    for i in range(0, len(texts), 100):
+        batch = texts[i : i + 100]
+        body = {"requests": [{"model": f"models/{EMBED_MODEL}", "content": {"parts": [{"text": t[:8000]}]}, "taskType": task, "outputDimensionality": EMBED_DIMS} for t in batch]}
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{EMBED_MODEL}:batchEmbedContents",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise AIError(f"索引を作れませんでした(HTTP {exc.code})", status=402 if exc.code == 402 else 503) from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise AIError(f"AI につながりませんでした({exc})") from exc
+        out += [e["values"] for e in data["embeddings"]]
+        # 埋めこみは数えるトークンが返らないので、文字数から多めに見積もる(日本語は 1文字 ≒ 1トークン)
+        record(db, EMBED_MODEL, sum(len(t[:8000]) for t in batch), 0)
+    return out
 
 
 def record(db: Callable, model: str, tokens_in: int, tokens_out: int) -> None:

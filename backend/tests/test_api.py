@@ -311,3 +311,107 @@ def test_ai_disabled_without_key(client, vault, monkeypatch):
     monkeypatch.setattr(ai, "KEY_FILE", None)
     assert client.get("/api/ai/status").json()["enabled"] is False
     assert client.post("/api/ai/tidy", json={"path": "a.md"}).status_code == 503
+
+
+# ---- 頭(索引・聞く・自動で整える)。AI は偽物(文字の並びから決まるベクトル・決まった答え) ----
+
+def fake_embed(texts, db, task="RETRIEVAL_DOCUMENT"):
+    import numpy as np
+    out = []
+    for t in texts:
+        v = np.zeros(768, dtype=np.float32)
+        for a, b in zip(t, t[1:]):
+            v[hash(a + b) % 768] += 1
+        out.append(list(v))
+    return out
+
+
+@pytest.fixture
+def brainy(client, vault, monkeypatch, tmp_path):
+    from app import ai, brain
+    monkeypatch.setattr(ai, "api_key", lambda: "dummy")
+    monkeypatch.setattr(ai, "embed", fake_embed)
+    monkeypatch.setattr(ai, "spent_yen", lambda db: 0.0)
+    monkeypatch.setattr(main, "TRASH_ROOT", tmp_path / "_整理待ち")
+    (tmp_path / "_整理待ち").mkdir()
+    (vault / "めも").mkdir(exist_ok=True)
+    return brain
+
+
+def test_index_and_ask(brainy, client, vault, monkeypatch):
+    from app import ai
+    (vault / "めも" / "オシロ.md").write_text("---\ndate: '2026-10-01'\n---\n\nオシロスコープの使い方: トリガーを合わせる\n", encoding="utf-8")
+    (vault / "めも" / "料理.md").write_text("---\ndate: '2026-10-02'\n---\n\nカレーの作り方\n", encoding="utf-8")
+    assert brainy.update_index()["updated"] >= 3
+    hits = brainy.search("オシロスコープのトリガー")
+    assert hits[0]["path"] == "めも/オシロ.md"
+    monkeypatch.setattr(ai, "generate_json", lambda prompt, *a, **k: {"answer": "[[オシロ]] に書いてあります" if "オシロ" in prompt else "?", "notes": ["オシロ"]})
+    r = client.post("/api/ai/ask", json={"question": "オシロの使い方どこに書いたっけ"}).json()
+    assert "[[オシロ]]" in r["answer"] and r["sources"][0]["path"] == "めも/オシロ.md"
+    (vault / "めも" / "料理.md").unlink()
+    assert brainy.update_index()["removed"] == 1
+
+
+def test_auto_tidy_and_undo(brainy, vault, monkeypatch):
+    import os, time
+    monkeypatch.setattr(main, "tidy_suggest", lambda rel, text: {"title": "RLC回路の授業", "tags": ["x", "新"], "tasks": [{"text": "演習を出す", "due": "2026-11-11"}, {"text": "期限なし", "due": None}], "summary": ""})
+    raw = "---\ndate: '2026-11-04'\n---\n\nメモ\n今日の授業 RLC 回路\n"
+    name = "メモ 2026-11-04 1030"
+    p = vault / "めも" / f"{name}.md"
+    p.write_text(raw, encoding="utf-8")
+    fresh = vault / "めも" / "書いたばかり.md"
+    fresh.write_text("---\ndate: '2026-11-04'\n---\n\nいま書いている途中の雑記\n", encoding="utf-8")
+    tagged = vault / "めも" / "タグあり.md"
+    tagged.write_text("---\ndate: '2026-11-04'\n---\n\n#x\n\nもうタグがある雑記です\n", encoding="utf-8")
+    old = time.time() - 20 * 60
+    os.utime(p, (old, old))
+    os.utime(tagged, (old, old))
+    done = brainy.auto_run_once()
+    assert [d["path"] for d in done] == ["めも/RLC回路の授業.md"]  # 書いたばかり・タグありは触らない
+    new = vault / "めも" / "RLC回路の授業.md"
+    assert not p.exists() and new.read_text(encoding="utf-8") == "---\ndate: '2026-11-04'\n---\n\n#x\n\nメモ\n今日の授業 RLC 回路\n"
+    task = (vault / "めも" / "演習を出す.md").read_text(encoding="utf-8")
+    assert "遂行日: 2026-11-11" in task and "元のメモ: [[RLC回路の授業]]" in task
+    assert not (vault / "めも" / "期限なし.md").exists()
+    assert brainy.auto_run_once() == []  # 同じものは2回整えない
+    log = brainy.auto_log()
+    brainy.auto_undo(log[0]["id"])
+    assert p.read_text(encoding="utf-8") == raw and not new.exists()
+    assert not (vault / "めも" / "演習を出す.md").exists()  # 作ったタスクは整理待ちへ
+    assert list((main.TRASH_ROOT).rglob("演習を出す.md"))
+
+
+def test_auto_undo_refuses_after_edit(brainy, vault, monkeypatch):
+    import os, time
+    monkeypatch.setattr(main, "tidy_suggest", lambda rel, text: {"title": "", "tags": ["x"], "tasks": [], "summary": ""})
+    p = vault / "めも" / "自分で付けた名前.md"
+    p.write_text("---\ndate: '2026-11-04'\n---\n\n今日の授業のメモの本文です\n", encoding="utf-8")
+    old = time.time() - 20 * 60
+    os.utime(p, (old, old))
+    brainy.auto_run_once()
+    assert p.exists() and "#x" in p.read_text(encoding="utf-8")  # 自分で付けた名前は変えない
+    p.write_text(p.read_text(encoding="utf-8") + "あとから書き足した\n", encoding="utf-8")
+    with pytest.raises(main.HTTPException) as e:
+        brainy.auto_undo(brainy.auto_log()[0]["id"])
+    assert e.value.status_code == 409 and "あとから書き足した" in p.read_text(encoding="utf-8")
+
+
+def test_auto_respects_switch(brainy, vault):
+    import os, time
+    brainy.kv_set("auto_enabled", "0")
+    p = vault / "めも" / "メモ 2026-11-04 1100.md"
+    p.write_text("---\ndate: '2026-11-04'\n---\n\n今日の授業のメモの本文です\n", encoding="utf-8")
+    old = time.time() - 20 * 60
+    os.utime(p, (old, old))
+    assert brainy.auto_run_once() == []
+    brainy.kv_set("auto_enabled", "1")
+
+
+def test_auto_skips_settings_notes(brainy, vault):
+    import os, time
+    for name, text in (("sortspec", "---\ndate: '2026-09-13'\nsorting-spec: |\n  /folders\n---\n\nめも フォルダの並べ替え設定\n"), ("設定っぽい", "---\nsorting-spec: x\n---\n\nこれは並べ替えの設定です\n")):
+        p = vault / "めも" / f"{name}.md"
+        p.write_text(text, encoding="utf-8")
+        old = time.time() - 20 * 60
+        os.utime(p, (old, old))
+    assert brainy.auto_candidates(time.time()) == []

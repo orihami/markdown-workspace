@@ -431,3 +431,26 @@ input, textarea { caret-color: var(--accent); }
 .tidy-task input[type="date"] { font: inherit; font-size: 13px; border: 1px solid var(--line); border-radius: 7px; padding: 4px 6px; color: var(--ink-2); }
 .tidy-cost { margin: 4px 0 0; font-size: 11.5px; color: var(--faint); }
 .spinner.inline { display: inline-block; vertical-align: -3px; margin-right: 6px; }
+
+/* 聞く(AI)・AI が整えたメモ */
+.ask-box { margin-top: 14px; background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 4px 12px; }
+.ask-box form { display: flex; align-items: center; gap: 8px; color: var(--accent); }
+.ask-box input { flex: 1; min-width: 0; border: 0; outline: 0; font: inherit; font-size: 15px; padding: 10px 0; background: transparent; color: var(--ink); }
+.ask-box input::placeholder { color: var(--faint); }
+.ask-result { padding: 4px 0 10px; }
+.ask-answer { font-size: 15px; line-height: 1.85; color: var(--ink); white-space: pre-wrap; padding: 6px 2px 10px; }
+.ask-link { border: 0; background: var(--accent-soft); color: var(--accent-ink); font: inherit; font-weight: 600; border-radius: 6px; padding: 0 5px; cursor: pointer; }
+.ask-sources { display: flex; flex-direction: column; gap: 4px; }
+.ask-source { display: flex; flex-direction: column; gap: 2px; text-align: left; border: 1px solid var(--line); background: var(--paper); border-radius: 10px; padding: 8px 10px; cursor: pointer; }
+.ask-source:hover { border-color: var(--line-2); }
+.ask-source.used { border-color: #eec4b2; }
+.ask-source b { font-size: 14px; color: var(--ink); }
+.ask-source small { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal.ask { max-width: 680px; }
+.ask-body { padding: 8px 16px 14px; max-height: 65vh; overflow: auto; }
+.switcher-item.ask .plus { color: var(--accent); }
+.auto-list { display: flex; flex-direction: column; }
+.auto-row { display: flex; align-items: center; gap: 10px; padding: 8px 4px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.auto-name { border: 0; background: transparent; padding: 0; font: inherit; font-size: 15px; color: var(--ink); cursor: pointer; text-align: left; }
+.auto-name:hover { color: var(--accent-ink); }
+.auto-row small { flex: 1; min-width: 0; font-size: 12px; color: var(--muted); }

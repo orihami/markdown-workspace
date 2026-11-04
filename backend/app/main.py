@@ -14,7 +14,7 @@ from uuid import UUID
 
 from dotenv import load_dotenv
 
-from . import ai
+from . import ai, brain
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -868,11 +868,12 @@ def name_from_body(text: str) -> str:
     return "メモ " + datetime.now().astimezone().strftime("%Y-%m-%d %H%M")
 
 
-def create_memo(body: str, task: bool = False, title: str = "") -> str:
+def create_memo(body: str, task: bool = False, title: str = "", day: str = "") -> str:
     """めも に date 付きのメモを作る(タスクなら 遂行日・完了・date)。名前はタイトルか本文の書き出し。作ったパスを返す"""
     root = ensure_root()
-    day = datetime.now().astimezone().strftime("%Y-%m-%d")
-    head = f"---\n遂行日: {day}\n完了: false\ndate: '{day}'\n---\n" if task else f"---\ndate: '{day}'\n---\n"
+    today_s = datetime.now().astimezone().strftime("%Y-%m-%d")
+    due = day if re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or "") else today_s
+    head = f"---\n遂行日: {due}\n完了: false\ndate: '{today_s}'\n---\n" if task else f"---\ndate: '{today_s}'\n---\n"
     content = head + "\n" + body.strip() + "\n"
     base = cleanup_name(title) or name_from_body(body)
     folder = root / MEMO_DIR
@@ -951,14 +952,25 @@ def ai_status():
     return {"enabled": ai.api_key() is not None, "spent_yen": round(ai.spent_yen(db), 2), "monthly_yen": ai.MONTHLY_YEN}
 
 
+def tags_known() -> list[str]:
+    return [i["tag"] for i in tags()["items"]]
+
+
 @app.post("/api/ai/tidy", dependencies=[Depends(require_auth)])
 def ai_tidy(body: TidyRequest):
     """雑記を整える提案: 名前・タグ(いまあるタグから)・課題/やることと期限・要約。ファイルは変えない(当てるのは画面で選んでから)"""
     path = safe_note_path(body.path, must_exist=body.content is None)
     text = body.content if body.content is not None else path.read_text(encoding="utf-8")
+    try:
+        return {**tidy_suggest(body.path, text), "spent_yen": round(ai.spent_yen(db), 2)}
+    except ai.AIError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+def tidy_suggest(note_path: str, text: str) -> dict:
     now = datetime.now().astimezone()
-    known = [i["tag"] for i in tags()["items"]][:150]
-    current_name = Path(body.path).stem
+    known = tags_known()[:150]
+    current_name = Path(note_path).stem
     prompt = f"""今日は {now.strftime('%Y-%m-%d')}({WEEK_JA[now.weekday()]}曜)です。次のメモを整えるための提案を JSON で返してください。
 
 - title: 中身がひと目で分かる名前。24文字くらいまで。いまの名前「{current_name}」がよければそのまま。ファイル名に使えない記号 \\ / : * ? " < > | # ^ [ ] は使わない
@@ -970,15 +982,13 @@ def ai_tidy(body: TidyRequest):
 <<<
 {text[:12000]}
 >>>"""
-    try:
-        out = ai.generate_json(prompt, TIDY_SCHEMA, db, system=TIDY_SYSTEM)
-    except ai.AIError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    out = ai.generate_json(prompt, TIDY_SCHEMA, db, system=TIDY_SYSTEM)
     title = cleanup_name(str(out.get("title") or ""))[:40]
     tag_list = []
     for t in out.get("tags") or []:
         t = re.sub(r"\s+", "", str(t)).lstrip("#")
-        if t and not t.replace("/", "").isdigit() and t not in tag_list:
+        # clippings は Web Clipper が付ける印なので、AI は付けない
+        if t and t != "clippings" and not t.replace("/", "").isdigit() and t not in tag_list:
             tag_list.append(t)
     tasks_out = []
     for t in out.get("tasks") or []:
@@ -988,7 +998,65 @@ def ai_tidy(body: TidyRequest):
         text_t = str(t.get("text") or "").strip() if isinstance(t, dict) else ""
         if text_t:
             tasks_out.append({"text": text_t[:80], "due": due})
-    return {"title": title, "tags": tag_list[:5], "new_tags": [t for t in tag_list if t not in known], "tasks": tasks_out[:10], "summary": str(out.get("summary") or "").strip()[:300], "spent_yen": round(ai.spent_yen(db), 2)}
+    return {"title": title, "tags": tag_list[:5], "new_tags": [t for t in tag_list if t not in known], "tasks": tasks_out[:10], "summary": str(out.get("summary") or "").strip()[:300]}
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+
+
+@app.post("/api/ai/ask", dependencies=[Depends(require_auth)])
+def ai_ask(body: AskRequest):
+    """「あのメモどこだっけ？」「あれってどんな内容だっけ？」: 自分のメモだけを根拠に答え、元のメモを出す"""
+    try:
+        return brain.ask(body.question.strip())
+    except ai.AIError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.get("/api/ai/index", dependencies=[Depends(require_auth)])
+def ai_index_status():
+    return brain.index_status()
+
+
+@app.post("/api/ai/index", dependencies=[Depends(require_auth)])
+def ai_index_update():
+    threading.Thread(target=lambda: _safe(brain.update_index), daemon=True).start()
+    return {"ok": True, "started": True}
+
+
+def _safe(fn):
+    try:
+        return fn()
+    except Exception as exc:
+        print("うしろの作業でエラー:", exc)
+
+
+class AutoSetting(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/ai/auto", dependencies=[Depends(require_auth)])
+def ai_auto():
+    return {"enabled": brain.auto_enabled(), "items": brain.auto_log()}
+
+
+@app.post("/api/ai/auto", dependencies=[Depends(require_auth)])
+def ai_auto_set(body: AutoSetting):
+    brain.kv_set("auto_enabled", "1" if body.enabled else "0")
+    return ai_auto()
+
+
+@app.post("/api/ai/auto/{log_id}/undo", dependencies=[Depends(require_auth)])
+def ai_auto_undo(log_id: int):
+    return brain.auto_undo(log_id)
+
+
+@app.on_event("startup")
+def start_brain():
+    # 見回り(自動で整える・索引)。テストでは動かさない(AI_BACKGROUND=0)
+    if os.getenv("AI_BACKGROUND", "1") != "0":
+        brain.start_background()
 
 
 # ---- お気に入り(どの端末からも同じ。Vault のファイルや Obsidian の設定には書かない) ----

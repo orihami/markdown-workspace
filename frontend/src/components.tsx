@@ -88,12 +88,13 @@ export function Tree({ node, open, toggle, active, onOpen, onContext, onFolderCo
 
 // ---- クイック検索(Ctrl+K): 名前はすぐ、本文はサーバーで探す ----
 
-export function QuickSwitcher({ notes, initial, onOpen, onCreate, onClose }: {
+export function QuickSwitcher({ notes, initial, onOpen, onCreate, onClose, onAsk }: {
   notes: Note[]
   initial: string
   onOpen: (path: string) => void
   onCreate: (name: string) => void
   onClose: () => void
+  onAsk?: (question: string) => void // AI に聞く(使えるときだけ)
 }) {
   const [q, setQ] = useState(initial)
   const [index, setIndex] = useState(0)
@@ -137,12 +138,14 @@ export function QuickSwitcher({ notes, initial, onOpen, onCreate, onClose }: {
   const results = [...local, ...remoteSorted.map((r) => ({ path: r.path, name: r.name, snippet: r.snippet ?? null }))]
   const dateOf = (path: string) => byPath.get(path)?.date?.slice(0, 10)
   const canCreate = !!q.trim() && !tagQuery && !notes.some((n) => n.name === q.trim())
-  const total = results.length + (canCreate ? 1 : 0)
+  const canAsk = !!onAsk && q.trim().length >= 2 && !tagQuery
+  const total = results.length + (canCreate ? 1 : 0) + (canAsk ? 1 : 0)
   useEffect(() => { setIndex(0) }, [q])
 
   const choose = (i: number) => {
     if (i < results.length) onOpen(results[i].path)
-    else if (canCreate) onCreate(q.trim())
+    else if (canCreate && i === results.length) onCreate(q.trim())
+    else if (canAsk) onAsk!(q.trim())
   }
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
@@ -181,6 +184,10 @@ export function QuickSwitcher({ notes, initial, onOpen, onCreate, onClose }: {
               <span className="plus">＋</span><span className="switcher-main"><b>「{q.trim()}」を新しく作る</b></span>
             </button>
           )}
+          {canAsk && (() => { const i = results.length + (canCreate ? 1 : 0); return (
+            <button className={`switcher-item ask ${index === i ? 'selected' : ''}`} onMouseMove={() => setIndex(i)} onClick={() => choose(i)}>
+              <span className="plus">✨</span><span className="switcher-main"><b>AI に聞く: 「{q.trim()}」</b><small>自分のメモから探して、どこに何が書いてあるかを答えます</small></span>
+            </button>) })()}
           {q.trim() && !busy && total === 0 && <div className="switcher-empty">見つかりませんでした</div>}
         </div>
         <div className="switcher-foot">↑↓ 選ぶ · Enter 開く · Esc 閉じる</div>
@@ -628,6 +635,61 @@ export function TidyDialog({ path, content, currentTags, onApply, onClose }: {
           <button className="btn" onClick={onClose}>やめる</button>
           <button className="btn primary" disabled={!res || busy || !!nothing} onClick={() => void apply()}>{busy ? '当てています…' : '選んだものを当てる'}</button>
         </div>
+      </div>
+    </div>
+  )
+}
+
+// ---- 聞く(AI): 「あのメモどこだっけ？」「あれってどんな内容だっけ？」に、自分のメモだけを根拠に答える ----
+
+export type AskResult = { answer: string; sources: { path: string; name: string; date: string; snippet: string; used: boolean }[]; spent_yen: number }
+
+export function AskPanel({ question, notes, onOpen }: { question: string; notes: Note[]; onOpen: (path: string) => void }) {
+  const [res, setRes] = useState<AskResult | null>(null)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    setRes(null)
+    setError('')
+    if (!question.trim()) return
+    api<AskResult>('/api/ai/ask', { method: 'POST', body: JSON.stringify({ question }) }, 60000).then(setRes).catch((e) => setError((e as Error).message))
+  }, [question])
+  if (!question.trim()) return null
+  const open = (name: string) => {
+    const hit = res?.sources.find((s) => s.name === name) || notes.find((n) => n.name === name)
+    if (hit) onOpen(hit.path)
+  }
+  // 答えの中の [[メモ名]] は押すと開く
+  const parts = (res?.answer || '').split(/(\[\[[^\]]+\]\])/g)
+  return (
+    <div className="ask-result">
+      {!res && !error && <p className="delete-info"><span className="spinner inline" /> 自分のメモから探しています…</p>}
+      {error && <p className="field-error">{error}</p>}
+      {res && <>
+        <div className="ask-answer">{parts.map((p, i) => p.startsWith('[[') ? <button key={i} className="ask-link" onClick={() => open(p.slice(2, -2).split('|')[0])}>{p.slice(2, -2)}</button> : <span key={i}>{p}</span>)}</div>
+        {res.sources.length > 0 && <div className="ask-sources">
+          {res.sources.map((s) => (
+            <button key={s.path} className={`ask-source ${s.used ? 'used' : ''}`} onClick={() => onOpen(s.path)}>
+              <b>{s.name}</b><small>{s.date ? s.date.replace(/-/g, '/') + ' · ' : ''}{s.snippet}</small>
+            </button>
+          ))}
+        </div>}
+      </>}
+    </div>
+  )
+}
+
+export function AskDialog({ initial, notes, onOpen, onClose }: { initial: string; notes: Note[]; onOpen: (path: string) => void; onClose: () => void }) {
+  const [q, setQ] = useState(initial)
+  const [asked, setAsked] = useState(initial)
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <div className="modal ask" onMouseDown={(e) => e.stopPropagation()} role="dialog" aria-label="AI に聞く">
+        <form className="switcher-input" onSubmit={(e) => { e.preventDefault(); setAsked(q.trim()) }}>
+          <Search size={17} />
+          <input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="あのメモどこだっけ？ あれってどんな内容だっけ？" onKeyDown={(e) => { if (e.key === 'Escape') onClose() }} />
+          <button className="icon-button" type="button" onClick={onClose} aria-label="閉じる"><X size={16} /></button>
+        </form>
+        <div className="ask-body"><AskPanel question={asked} notes={notes} onOpen={onOpen} />{!asked && <p className="delete-info">自分のメモの中から探して、どのメモに何が書いてあるかを答えます。</p>}</div>
       </div>
     </div>
   )

@@ -43,7 +43,7 @@ let apiProc
 function startApi() {
   apiProc = spawn(join(root, 'backend/.venv/bin/uvicorn'), ['app.main:app', '--host', '127.0.0.1', '--port', String(port)], {
     cwd: join(root, 'backend'),
-    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base, TRASH_ROOT: trashDir, VAULT_LABEL: 'OMNI', SNAPSHOT_ROOT: snapDir },
+    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base, TRASH_ROOT: trashDir, VAULT_LABEL: 'OMNI', SNAPSHOT_ROOT: snapDir, AI_BACKGROUND: '0' },
     stdio: 'ignore',
   })
   return waitFor(async () => (await fetch(base + '/api/health').catch(() => null))?.ok)
@@ -367,6 +367,34 @@ try {
   // (完了にすると一覧から外れるので、ふつうにクリックしてファイルで確かめる)
   await page.click('.task-row:has-text("タスクA") input')
   check(await waitFor(() => read('めも/タスクA.md').includes('完了: true'), 10000), 'ホームのタスクは開かずにチェックで完了にできる')
+
+  // 聞く(AI は偽物): 「あのメモどこだっけ？」→ 答えの中のメモ名を押すと開く
+  let undone = false
+  await page.route('**/api/ai/status', (r) => r.fulfill({ json: { enabled: true, spent_yen: 1.2, monthly_yen: 300 } }))
+  await page.route('**/api/ai/ask', (r) => r.fulfill({ json: { answer: 'CRLF のことは [[メモ]] に書いてあります。', sources: [{ path: 'sub/メモ.md', name: 'メモ', date: '', snippet: 'CRLF のノート', used: true }], spent_yen: 1.3 } }))
+  await page.route('**/api/ai/auto', (r) => r.fulfill({ json: { enabled: true, items: [{ id: 7, path_before: 'めも/メモ 2026-11-04 1030.md', path: 'めも/新しいメモ.md', tags: ['学校'], tasks: ['めも/演習を出す.md'], at: new Date().toISOString(), undone }] } }))
+  await page.route('**/api/ai/auto/7/undo', (r) => { undone = true; r.fulfill({ json: { ok: true, path: 'めも/新しいメモ.md' } }) })
+  await page.reload()
+  await page.waitForSelector('.ask-box input')
+  await page.fill('.ask-box input', 'CRLF のことどこに書いたっけ')
+  await page.press('.ask-box input', 'Enter')
+  await page.waitForSelector('.ask-answer .ask-link')
+  check((await page.textContent('.ask-answer')).includes('メモ') && await page.isVisible('.ask-source:has-text("メモ")'), '聞く: 自分のメモから答え、元のメモを出す')
+  check(await page.isVisible('.auto-row:has-text("新しいメモ")') && (await page.textContent('.auto-row')).includes('#学校'), 'AI が自動で整えたメモがホームに出る(タグ・タスク・元の名前)')
+  await page.click('.auto-row button:has-text("元に戻す")')
+  await page.waitForSelector('.toast:has-text("元に戻しました")')
+  check(undone, '自動で整えたのを「元に戻す」で戻せる')
+  await page.click('.ask-answer .ask-link')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.value === 'メモ')
+  check(true, '聞く: 答えの中の [[メモ名]] を押すとそのメモが開く')
+  await page.keyboard.press('Control+k')
+  await page.fill('.switcher-input input', 'オシロの使い方')
+  await page.waitForSelector('.switcher-item.ask')
+  await page.click('.switcher-item.ask')
+  await page.waitForSelector('.modal.ask .ask-answer')
+  check(true, 'Ctrl+K から「AI に聞く」')
+  await page.keyboard.press('Escape')
+  await page.unroute('**/api/ai/status'); await page.unroute('**/api/ai/ask'); await page.unroute('**/api/ai/auto'); await page.unroute('**/api/ai/auto/7/undo')
 
   // API を止めても書ける → 保存済みにならない → 戻ると自動で送る
   await page.click('.note-item:has-text("はじめに")')

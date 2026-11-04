@@ -8,7 +8,7 @@ import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode, pasteImages } from './livePreview'
 import { slashSource, workspaceCompletions } from './completions'
-import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, TidyApply, TidyDialog, useKeyboardInset, VersionsDialog } from './components'
+import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, TidyApply, TidyDialog, useKeyboardInset, VersionsDialog, AskDialog, AskPanel } from './components'
 import { applyChanges, Change, cleanName, inMemoFolder, makeTask, removeProp, setTags as setTagLine, tagLine, MEMO_FOLDER, nameFromBody, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
 import { uuid } from './uuid'
 import { findDate, nextOccurrence, REPEATS, shortDay, TASK_WORDS } from './jdate'
@@ -73,7 +73,18 @@ export default function App() {
   const [versionsOpen, setVersionsOpen] = useState(false)
   const [tidyOpen, setTidyOpen] = useState(false)
   const [aiOn, setAiOn] = useState(false)
-  useEffect(() => { api<{ enabled: boolean }>('/api/ai/status').then((r) => setAiOn(r.enabled)).catch(() => setAiOn(false)) }, [])
+  const [aiSpent, setAiSpent] = useState<{ spent: number; cap: number } | null>(null)
+  // 聞く(AI): ホームの欄と、探す画面から
+  const [askText, setAskText] = useState('')
+  const [asked, setAsked] = useState('')
+  const [askDialog, setAskDialog] = useState<string | null>(null)
+  // 自動で整えたメモ(ホームに出して、元に戻せる)
+  const [auto, setAuto] = useState<{ enabled: boolean; items: { id: number; path_before: string; path: string; tags: string[]; tasks: string[]; at: string; undone: boolean }[] }>({ enabled: true, items: [] })
+  const [indexInfo, setIndexInfo] = useState<{ notes: number; chunks: number; updated_at: string | null } | null>(null)
+  const loadAuto = useCallback(() => { api<typeof auto>('/api/ai/auto').then(setAuto).catch(() => {}) }, [])
+  useEffect(() => {
+    api<{ enabled: boolean; spent_yen: number; monthly_yen: number }>('/api/ai/status').then((r) => { setAiOn(r.enabled); setAiSpent({ spent: r.spent_yen, cap: r.monthly_yen }); if (r.enabled) loadAuto() }).catch(() => setAiOn(false))
+  }, [loadAuto])
   const [notice, setNotice] = useState('')
   const [vaultName, setVaultName] = useState(() => load('obsidian.vault', 'OMNI'))
   // 並べ替え(OMNIメモアプリと同じ種類。めもの sortspec と同じ「日付が新しい順」が最初)
@@ -488,6 +499,17 @@ export default function App() {
     void loadTree()
     void loadTags()
     setToast({ text: `整えました${made.length ? `(タスク ${made.length}件: ${made.join('・')})` : ''}` })
+  }
+
+  const undoAuto = async (id: number) => {
+    try {
+      const r = await api<{ path: string }>(`/api/ai/auto/${id}/undo`, { method: 'POST' })
+      await loadTree()
+      loadAuto()
+      setToast({ text: '自動で整えたのを元に戻しました', action: '開く', onAction: () => void openNote(r.path) })
+    } catch (e) {
+      setToast({ text: (e as ApiError).message })
+    }
   }
 
   // タスクを開かずに書きかえる(そのノートを開いていればエディタから。そうでなければ読んで、変えて、保存する)
@@ -1047,7 +1069,27 @@ export default function App() {
                 <button className="btn primary" disabled={!capture.trim()} onClick={() => void saveCapture()}>めもに残す</button>
               </div>
             </div>
+            {aiOn && <div className="ask-box">
+              <form onSubmit={(e) => { e.preventDefault(); setAsked(askText.trim()) }}>
+                <Sparkles size={16} />
+                <input value={askText} onChange={(e) => setAskText(e.target.value)} placeholder="あのメモどこだっけ？ あれってどんな内容だっけ？" aria-label="AI に聞く" />
+                {askText.trim() && <button className="btn tiny" type="submit">聞く</button>}
+              </form>
+              <AskPanel question={asked} notes={notes} onOpen={(p) => void openNote(p)} />
+            </div>}
             {apiOk === false && <p className="home-empty">サーバーにつながりません。つながると一覧が出ます。</p>}
+            {auto.items.some((a) => !a.undone && Date.now() - new Date(a.at).getTime() < 3 * 86400000) && <section className="home-sec">
+              <h2>AI が整えたメモ</h2>
+              <div className="auto-list">
+                {auto.items.filter((a) => !a.undone && Date.now() - new Date(a.at).getTime() < 3 * 86400000).slice(0, 5).map((a) => (
+                  <div key={a.id} className="auto-row">
+                    <button className="auto-name" onClick={() => void openNote(a.path)}>{nameOf(a.path)}</button>
+                    <small>{a.path !== a.path_before ? `名前を変えた(元: ${nameOf(a.path_before)}) · ` : ''}{a.tags.map((t) => '#' + t).join(' ')}{a.tasks.length ? ` · タスク ${a.tasks.length}件: ${a.tasks.map(nameOf).join('・')}` : ''}</small>
+                    <button className="btn tiny" onClick={() => void undoAuto(a.id)}>元に戻す</button>
+                  </div>
+                ))}
+              </div>
+            </section>}
 
             {(todayTasks.length > 0 || upcoming.length > 0) && <section className="home-sec">
               <div className="sec-head"><h2>タスク</h2>{todayTasks.some((n) => n.task_day! < today()) && <button className="chip" onClick={() => void moveOverdue()}>期限切れ {todayTasks.filter((n) => n.task_day! < today()).length}件を今日に</button>}</div>
@@ -1095,10 +1137,13 @@ export default function App() {
         <div className="settings-row"><div><strong>表示</strong><small>どれも書いたまま保存。見た目だけ変わる(Ctrl+E でソースと切りかえ)</small></div><select value={presentation} onChange={(e) => choosePresentation(e.target.value as Presentation)}>{PRESENTATIONS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</select></div>
         <div className="settings-row"><div><strong>Obsidian の保管庫名</strong><small>「Obsidian で開く」に使う</small></div><input value={vaultName} onChange={(e) => { setVaultName(e.target.value); store('obsidian.vault', e.target.value) }} /></div>
         <div className="settings-row"><div><strong>送信待ち</strong><small>端末に残っていて、サーバーの確認がまだのもの</small></div><span className="setting-value">{pending}件 {pending > 0 && <button className="btn tiny" onClick={() => engine.saveNow()}>今すぐ送る</button>}</span></div>
+        {aiOn && <div className="settings-row"><div><strong>AI が自動で整える</strong><small>15分さわっていないタグなしの雑記に、タグ・期限つきのタスク・(自動で付いた名前なら)名前を。本文は変えない</small></div><input type="checkbox" checked={auto.enabled} onChange={(e) => api<typeof auto>('/api/ai/auto', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }).then(setAuto).catch(() => {})} aria-label="AI が自動で整える" /></div>}
+        {aiOn && <div className="settings-row"><div><strong>AI(今月)</strong><small>{aiSpent ? `${aiSpent.spent.toFixed(1)}円 / 上限 ${aiSpent.cap.toFixed(0)}円(なんでも博士と同じクレジット)` : ''}{indexInfo ? ` · 索引 ${indexInfo.notes}件` : ''}</small></div><button className="btn tiny" onClick={() => { void api('/api/ai/index', { method: 'POST' }); api<typeof indexInfo>('/api/ai/index').then(setIndexInfo).catch(() => {}) }}>索引を更新</button></div>}
         <div className="settings-row"><div><strong>キー</strong><small>Ctrl+K 探す · Alt+N 新しいメモ · Ctrl+S すぐ保存 · Ctrl+E ソース · / 候補 · [[ リンク</small></div></div>
       </div>}
 
-      {switcher !== null && <QuickSwitcher notes={notes} initial={switcher} onClose={() => setSwitcher(null)} onOpen={(p) => { setSwitcher(null); void openNote(p) }} onCreate={(name) => openNewNote(name)} />}
+      {switcher !== null && <QuickSwitcher notes={notes} initial={switcher} onClose={() => setSwitcher(null)} onOpen={(p) => { setSwitcher(null); void openNote(p) }} onCreate={(name) => openNewNote(name)} onAsk={aiOn ? (q) => { setSwitcher(null); setAskDialog(q) } : undefined} />}
+      {askDialog !== null && <AskDialog initial={askDialog} notes={notes} onClose={() => setAskDialog(null)} onOpen={(p) => { setAskDialog(null); void openNote(p) }} />}
       {diff && <DiffDialog mine={diff.mine} server={diff.server} onClose={() => setDiff(null)} />}
       {tidyOpen && active && <TidyDialog path={active} content={contentRef.current} currentTags={tagLine(contentRef.current)?.tags ?? []} onClose={() => setTidyOpen(false)} onApply={applyTidy} />}
       {versionsOpen && active && <VersionsDialog path={active} current={contentRef.current} onClose={() => setVersionsOpen(false)} onRestore={(content, day) => {

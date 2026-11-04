@@ -9,8 +9,9 @@ import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode, pasteImages } from './livePreview'
 import { slashSource, workspaceCompletions } from './completions'
 import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, useKeyboardInset, VersionsDialog } from './components'
-import { applyChanges, cleanName, inMemoFolder, makeTask, MEMO_FOLDER, nameFromBody, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
+import { applyChanges, Change, cleanName, inMemoFolder, makeTask, removeProp, MEMO_FOLDER, nameFromBody, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
 import { uuid } from './uuid'
+import { findDate, nextOccurrence, REPEATS, shortDay, TASK_WORDS } from './jdate'
 
 // 表示(仕様 4.3)。どれも同じエディタで直接書き、ファイルの中身は変えない(見た目だけ)
 //   obsidian: ライブプレビュー(カーソルの行だけ記号が見える) / notion: 記号を隠し、改行で候補 / source: 記号をそのまま
@@ -267,7 +268,8 @@ export default function App() {
     if (!body.trim() && !t) return
     creating.current = true
     try {
-      const header = newNoteContent(d.kind, { day: today() })
+      // タスクなら、タイトルや書き出しに書いた日付(「来週水曜」など)を遂行日にする
+      const header = newNoteContent(d.kind, { day: findDate(`${t}\n${body.slice(0, 300)}`)?.day ?? today() })
       const base = t || nameFromBody(body)
       let path = ''
       let etag = ''
@@ -424,7 +426,7 @@ export default function App() {
     const name = uniqueName(folder, nameFromBody(text))
     const path = `${folder ? folder + '/' : ''}${name}.md`
     try {
-      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content: newNoteContent(captureTask ? 'task' : 'memo', { day: today() }) + text + '\n' }) })
+      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content: newNoteContent(captureTask ? 'task' : 'memo', { day: captureDate?.day ?? today() }) + text + '\n' }) })
     } catch (e) {
       setToast({ text: `まだ残せていません: ${(e as ApiError).message}(書いた内容は欄に残っています)` })
       return
@@ -452,18 +454,36 @@ export default function App() {
     setTimeout(() => void createFromDraftRef.current(), 400)
   }
 
-  // ホームのタスク: 開かずにチェックして完了にする(そのノートを開いていればエディタから)
-  const setTaskDone = async (n: Note, done: boolean) => {
-    if (docPathRef.current === n.path) { editHead(setProp(contentRef.current, '完了', done ? 'true' : 'false')); return }
+  // タスクを開かずに書きかえる(そのノートを開いていればエディタから。そうでなければ読んで、変えて、保存する)
+  const updateTask = async (n: Note, fn: (text: string) => Change[], local: Partial<Note>) => {
     try {
-      const r = await api<NoteResponse>(notePath(n.path))
-      const next = applyChanges(r.content, setProp(r.content, '完了', done ? 'true' : 'false'))
-      await api(notePath(n.path), { method: 'PUT', body: JSON.stringify({ content: next, base_etag: r.etag, mutation_id: uuid() }) })
-      setNotes((list) => list.map((x) => (x.path === n.path ? { ...x, done } : x)))
-      if (done) setToast({ text: `「${n.name}」を完了にしました`, action: '元に戻す', onAction: () => void setTaskDone({ ...n, done: true }, false) })
+      if (docPathRef.current === n.path) editHead(fn(contentRef.current))
+      else {
+        const r = await api<NoteResponse>(notePath(n.path))
+        const next = applyChanges(r.content, fn(r.content))
+        await api(notePath(n.path), { method: 'PUT', body: JSON.stringify({ content: next, base_etag: r.etag, mutation_id: uuid() }) })
+      }
+      setNotes((list) => list.map((x) => (x.path === n.path ? { ...x, ...local } : x)))
+      return true
     } catch (e) {
       setToast({ text: `変えられませんでした: ${(e as ApiError).message}` })
+      return false
     }
+  }
+  // 完了にする。くり返すタスクは、完了にせず次の回の日付へ進める
+  const setTaskDone = async (n: Note, done: boolean) => {
+    const next = done && n.repeat ? nextOccurrence(n.task_day || '', n.repeat) : null
+    if (next) {
+      if (await updateTask(n, (t) => setProp(t, '遂行日', next), { task_day: next })) setToast({ text: `「${n.name}」をやりました。次は ${shortDay(next)}(${n.repeat})`, action: '元に戻す', onAction: () => void updateTask({ ...n, task_day: next }, (t) => setProp(t, '遂行日', n.task_day || today()), { task_day: n.task_day }) })
+      return
+    }
+    if (await updateTask(n, (t) => setProp(t, '完了', done ? 'true' : 'false'), { done }) && done) setToast({ text: `「${n.name}」を完了にしました`, action: '元に戻す', onAction: () => void setTaskDone({ ...n, done: true }, false) })
+  }
+  const moveTask = (n: Note, day: string) => updateTask(n, (t) => setProp(t, '遂行日', day), { task_day: day })
+  const moveOverdue = async () => {
+    const list = todayTasks.filter((n) => n.task_day! < today())
+    for (const n of list) await moveTask(n, today())
+    setToast({ text: `期限切れの ${list.length} 件を今日にしました` })
   }
 
   // ---- リンクを押したとき ----
@@ -622,6 +642,9 @@ export default function App() {
     focusExt,
   ], [focusExt, paste])
   saveCaptureRef.current = saveCapture
+  // すぐ書く欄: 書いた日付(「来週水曜」など)。課題っぽい言葉と一緒なら、タスクにするか出す
+  const captureDate = useMemo(() => findDate(capture.slice(0, 300)), [capture])
+  const captureSuggest = !captureTask && !!captureDate && TASK_WORDS.test(capture.slice(0, 300))
   const extensions = useMemo(() => [
     markdown({ base: markdownLanguage }),
     EditorView.lineWrapping,
@@ -812,6 +835,7 @@ export default function App() {
   const isTask = !!(propValue(head, '遂行日') || propValue(head, '完了'))
   const done = /^true$/i.test(propValue(head, '完了')?.value || '')
   const taskDay = propValue(head, '遂行日')?.value || ''
+  const repeat = propValue(head, 'くり返し')?.value || ''
 
   return (
     <div className="app-shell">
@@ -876,9 +900,9 @@ export default function App() {
             <button className="tool icon" onClick={() => setSidebarOpen((v) => !v)} aria-label="一覧を開く・閉じる"><Menu size={18} /></button>
             {doc && <div className="breadcrumbs" title={active}>{(draft ? draft.folder : folderOf(active)).split('/').filter(Boolean).join(' / ')}</div>}
             <div className="top-tools">
-              {draft && <button className={`tool ${draft.kind === 'task' ? 'on' : ''}`} onClick={() => setDraft({ ...draft, kind: draft.kind === 'task' ? 'memo' : 'task' })} title="今日のタスクとして作る"><ListChecks size={15} /> {draft.kind === 'task' ? 'タスク(今日)' : 'タスクにする'}</button>}
+              {draft && <button className={`tool ${draft.kind === 'task' ? 'on' : ''}`} onClick={() => setDraft({ ...draft, kind: draft.kind === 'task' ? 'memo' : 'task' })} title="今日のタスクとして作る"><ListChecks size={15} /> {draft.kind === 'task' ? `タスク(${shortDay(findDate(`${title}\n${contentRef.current.slice(0, 300)}`)?.day ?? today())})` : 'タスクにする'}</button>}
               {draft && <span className="draft-hint">書くと{draft.folder ? `「${draft.folder}」` : ''}に作ります</span>}
-              {doc && !draft && !isTask && <button className="tool" onClick={() => editHead(makeTask(contentRef.current))} title="遂行日・完了 を付けてタスクにする"><ListChecks size={15} /> タスクにする</button>}
+              {doc && !draft && !isTask && <button className="tool" onClick={() => editHead(makeTask(contentRef.current, findDate(`${nameOf(active)}\n${contentRef.current.slice(head.length - 1, head.length + 300)}`)?.day ?? today()))} title="遂行日・完了 を付けてタスクにする(書いた日付があればその日に)"><ListChecks size={15} /> タスクにする</button>}
               {sync && <button className={`save-indicator s-${sync.status}`} title={sync.message || STATUS_LABEL[sync.status]} onClick={() => engine.saveNow(active)} aria-live="polite">
                 {STATUS_ICON[sync.status]}<span>{STATUS_LABEL[sync.status]}</span>{pending > 1 && <em>+{pending - 1}</em>}
               </button>}
@@ -905,7 +929,11 @@ export default function App() {
 
             <article className="document">
               <div className="title-row">
-                {isTask && <input type="checkbox" className="title-check" checked={done} onChange={(e) => editHead(setProp(contentRef.current, '完了', e.target.checked ? 'true' : 'false'))} aria-label="完了" />}
+                {isTask && <input type="checkbox" className="title-check" checked={done} onChange={(e) => {
+                  const next = e.target.checked && repeat ? nextOccurrence(taskDay, repeat) : null
+                  if (next) { editHead(setProp(contentRef.current, '遂行日', next)); setToast({ text: `やりました。次は ${shortDay(next)}(${repeat})` }) }
+                  else editHead(setProp(contentRef.current, '完了', e.target.checked ? 'true' : 'false'))
+                }} aria-label="完了" />}
                 <input
                   className={`document-title ${done ? 'done' : ''} ${fresh && fresh === active ? 'auto' : ''}`}
                   value={title}
@@ -924,6 +952,12 @@ export default function App() {
                 <label>遂行日<input type="date" value={/^\d{4}-\d{2}-\d{2}/.test(taskDay) ? taskDay.slice(0, 10) : ''} onChange={(e) => e.target.value && editHead(setProp(contentRef.current, '遂行日', e.target.value))} aria-label="遂行日" /></label>
                 {!done && taskDay && taskDay < today() && <span className="late">期限を過ぎています</span>}
                 {!done && taskDay === today() && <span className="today">今日</span>}
+                <label className="repeat">くり返し
+                  <select value={repeat} onChange={(e) => editHead(e.target.value ? setProp(contentRef.current, 'くり返し', e.target.value) : removeProp(contentRef.current, 'くり返し'))} aria-label="くり返し">
+                    <option value="">なし</option>
+                    {REPEATS.map((r) => <option key={r} value={r}>{r}</option>)}
+                  </select>
+                </label>
               </div>}
               {!draft && <NoteMeta
                 text={head}
@@ -970,7 +1004,7 @@ export default function App() {
                 />
               </div>
               <div className="capture-bar">
-                <button className={`chip ${captureTask ? 'on' : ''}`} onClick={() => setCaptureTask((v) => !v)}><ListChecks size={14} /> 今日のタスク</button>
+                <button className={`chip ${captureTask ? 'on' : captureSuggest ? 'suggest' : ''}`} onClick={() => setCaptureTask((v) => !v)} title="書いた日付(来週水曜・11/11 など)を遂行日にする"><ListChecks size={14} /> {captureTask ? `タスク(${shortDay(captureDate?.day ?? today())})` : captureSuggest ? `タスクにする(${shortDay(captureDate!.day)})` : 'タスクにする'}</button>
                 <button className={`chip ${capture.split('\n').length > 6 ? 'on' : ''}`} onClick={expandCapture} disabled={!capture.trim()} title="大きな画面に移して続きを書く">広げて書く ↗</button>
                 <span className="capture-hint">Ctrl+Enter で残す · 名前は書き出しから付きます</span>
                 <button className="btn primary" disabled={!capture.trim()} onClick={() => void saveCapture()}>めもに残す</button>
@@ -979,13 +1013,18 @@ export default function App() {
             {apiOk === false && <p className="home-empty">サーバーにつながりません。つながると一覧が出ます。</p>}
 
             {(todayTasks.length > 0 || upcoming.length > 0) && <section className="home-sec">
-              <h2>タスク</h2>
+              <div className="sec-head"><h2>タスク</h2>{todayTasks.some((n) => n.task_day! < today()) && <button className="chip" onClick={() => void moveOverdue()}>期限切れ {todayTasks.filter((n) => n.task_day! < today()).length}件を今日に</button>}</div>
               <div className="task-list">
                 {[...todayTasks, ...upcoming].map((n) => (
                   <div key={n.path} className={`task-row ${n.done ? 'done' : ''}`}>
                     <input type="checkbox" checked={!!n.done} onChange={(e) => void setTaskDone(n, e.target.checked)} aria-label={`${n.name} を完了にする`} />
                     <button onClick={() => void openNote(n.path)}>{n.name}</button>
-                    <small className={n.task_day! < today() ? 'late' : n.task_day === today() ? 'today' : ''}>{n.task_day! < today() ? '期限すぎ ' : n.task_day === today() ? '今日' : ''}{n.task_day === today() ? '' : n.task_day!.slice(5).replace('-', '/')}</small>
+                    <small className={n.task_day! < today() ? 'late' : n.task_day === today() ? 'today' : ''}>{n.repeat ? '↻ ' : ''}{n.task_day! < today() ? '期限すぎ ' : n.task_day === today() ? '今日' : ''}{n.task_day === today() ? '' : n.task_day!.slice(5).replace('-', '/')}</small>
+                    <span className="task-move">
+                      {n.task_day !== today() && <button onClick={() => void moveTask(n, today())} title="今日にする">今日</button>}
+                      <button onClick={() => { const d = new Date(); d.setDate(d.getDate() + 1); void moveTask(n, today(d)) }} title="明日にする">明日</button>
+                      <button onClick={() => { const d = new Date((n.task_day! > today() ? n.task_day! : today()) + 'T00:00:00'); d.setDate(d.getDate() + 7); void moveTask(n, today(d)) }} title="1週間後にする">+1週</button>
+                    </span>
                   </div>
                 ))}
               </div>

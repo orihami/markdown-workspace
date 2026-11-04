@@ -199,3 +199,18 @@ export function applyChanges(text: string, changes: Change[]) {
   for (const c of [...changes].sort((a, b) => b.from - a.from)) out = out.slice(0, c.from) + c.insert + out.slice(c.to ?? c.from)
   return out
 }
+
+// プロパティを1行消す(値がリストなど次の行に続くものは、その行も)
+export function removeProp(text: string, key: string): Change[] {
+  const fm = parseFront(text)
+  const p = fm?.props.find((x) => x.key === key)
+  if (!fm || !p) return []
+  const lines = fm.lines
+  let end = p.line + 1
+  while (end < fm.closeLine && /^\s/.test(lines[end])) end++
+  let from = 0
+  for (let i = 0; i < p.line; i++) from += lines[i].length + 1
+  let to = from
+  for (let i = p.line; i < end; i++) to += lines[i].length + 1
+  return [{ from, to, insert: '' }]
+}

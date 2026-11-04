@@ -395,7 +395,7 @@ def sort_props(text: Optional[str]) -> dict:
     fm, _ = split_frontmatter(text)
     out: dict = {"has_props": bool(fm) or text.lstrip("\ufeff").startswith("---")}
     for i, line in enumerate(fm):
-        m = re.match(r"^(date|遂行日|完了)\s*:\s*(.*)$", line)
+        m = re.match(r"^(date|遂行日|完了|くり返し)\s*:\s*(.*)$", line)
         if not m:
             continue
         key, value = m.group(1), _scalar(m.group(2))
@@ -405,6 +405,9 @@ def sort_props(text: Optional[str]) -> dict:
             out["date"] = value or None
         elif key == "遂行日":
             out["task_day"] = value or None
+        elif key == "くり返し":
+            out["repeat"] = value or None
+            continue
         else:
             out["done"] = value.lower() == "true"
     if "task_day" in out or "done" in out:

@@ -37,6 +37,8 @@ export type Note = {
   task_day?: string | null
   done?: boolean
   repeat?: string | null // くり返し(毎日・平日・毎週・毎月)
+  seisaku?: string | null // 制作ログの記録の ID(プロパティ「制作ログ」)
+  deadline?: string | null // 締切(講義棚の課題など。'YYYY-MM-DD HH:MM')
   excerpt?: string // 本文の書き出し(ホームに出す)
   tags?: string[]
 }

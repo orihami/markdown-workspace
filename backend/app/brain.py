@@ -403,6 +403,12 @@ def start_background() -> None:
         n = 0
         while True:
             try:
+                # 講義棚の課題 → めも のタスク(AI は使わない)
+                from . import kogi
+                kogi.sync()
+            except Exception as exc:
+                print("講義棚の取りこみでエラー:", exc)
+            try:
                 if ai.api_key() is not None:
                     if n % 6 == 0:
                         update_index()

@@ -14,7 +14,7 @@ from uuid import UUID
 
 from dotenv import load_dotenv
 
-from . import ai, brain
+from . import ai, brain, kogi, seisaku
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -397,7 +397,7 @@ def sort_props(text: Optional[str]) -> dict:
     fm, _ = split_frontmatter(text)
     out: dict = {"has_props": bool(fm) or text.lstrip("\ufeff").startswith("---")}
     for i, line in enumerate(fm):
-        m = re.match(r"^(date|遂行日|完了|くり返し)\s*:\s*(.*)$", line)
+        m = re.match(r"^(date|遂行日|完了|くり返し|締切|制作ログ)\s*:\s*(.*)$", line)
         if not m:
             continue
         key, value = m.group(1), _scalar(m.group(2))
@@ -409,6 +409,12 @@ def sort_props(text: Optional[str]) -> dict:
             out["task_day"] = value or None
         elif key == "くり返し":
             out["repeat"] = value or None
+            continue
+        elif key == "締切":
+            out["deadline"] = value or None
+            continue
+        elif key == "制作ログ":
+            out["seisaku"] = value or None
             continue
         else:
             out["done"] = value.lower() == "true"
@@ -1050,6 +1056,52 @@ def ai_auto_set(body: AutoSetting):
 @app.post("/api/ai/auto/{log_id}/undo", dependencies=[Depends(require_auth)])
 def ai_auto_undo(log_id: int):
     return brain.auto_undo(log_id)
+
+
+# ---- 制作ログ(読むだけ)。メモとのつながりは、メモのプロパティ「制作ログ: 記録のID」 ----
+
+@app.get("/api/seisaku", dependencies=[Depends(require_auth)])
+def seisaku_month(month: str):
+    return {"configured": seisaku.ROOT is not None and seisaku.ROOT.is_dir(), "items": seisaku.logs(month)}
+
+
+@app.get("/api/seisaku/log/{log_id}", dependencies=[Depends(require_auth)])
+def seisaku_log(log_id: str):
+    found = seisaku.find(log_id)
+    if not found:
+        raise HTTPException(status_code=404, detail="制作ログが見つかりません")
+    return found
+
+
+@app.get("/api/seisaku/photo", dependencies=[Depends(require_auth)])
+def seisaku_photo(path: str):
+    try:
+        return FileResponse(seisaku.photo(path), headers={"Cache-Control": "private, max-age=86400"})
+    except (FileNotFoundError, OSError, ValueError):
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+# ---- 講義棚の課題 → めも のタスク ----
+
+class KogiMap(BaseModel):
+    code: str = Field(min_length=1, max_length=100)
+    course: str = Field(default="", max_length=100)
+
+
+@app.get("/api/kogi", dependencies=[Depends(require_auth)])
+def kogi_status():
+    return kogi.status()
+
+
+@app.post("/api/kogi/map", dependencies=[Depends(require_auth)])
+def kogi_map(body: KogiMap):
+    kogi.set_course(body.code, body.course.strip())
+    return kogi.status()
+
+
+@app.post("/api/kogi/sync", dependencies=[Depends(require_auth)])
+def kogi_sync():
+    return kogi.sync()
 
 
 @app.on_event("startup")

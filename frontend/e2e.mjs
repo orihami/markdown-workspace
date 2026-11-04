@@ -25,6 +25,17 @@ writeFileSync(join(vault, 'めも', 'タスクA.md'), `---\n遂行日: ${T}\n完
 writeFileSync(join(vault, 'めも', '日付なし.md'), 'プロパティの無いメモ\n')
 writeFileSync(join(vault, 'めも', 'sortspec.md'), "---\ndate: '2026-09-13'\n---\n\n並べ替えの設定\n")
 writeFileSync(join(vault, 'めも', '期限切れの課題.md'), "---\n遂行日: 2026-10-01\n完了: false\ndate: '2026-10-01'\n---\n")
+// 制作ログ(スマホのアプリが置く形)。今日の記録を1つ
+const seisakuDir = join(work, '制作ログ')
+const LOG_ID = 'aaaaaaaa-1111-2222-3333-444444444444'
+{
+  const d = join(seisakuDir, T.slice(0, 4), T.slice(5, 7), T, LOG_ID)
+  mkdirSync(d, { recursive: true })
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64')
+  writeFileSync(join(d, '01_x.jpg'), png)
+  writeFileSync(join(d, 'thumb_01_x.jpg'), png)
+  writeFileSync(join(d, 'log.json'), JSON.stringify({ schemaVersion: 1, id: LOG_ID, date: T, createdAt: 1, modifiedAt: 1, title: 'キーボードの試作', intention: '左手だけで打てるように', memo: '', photos: [{ name: '01_x.jpg' }] }))
+}
 const dayAfter = (n) => { const d = new Date(now); d.setDate(d.getDate() + n); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` }
 const trashDir = join(work, '_整理待ち')
 mkdirSync(trashDir)
@@ -43,7 +54,7 @@ let apiProc
 function startApi() {
   apiProc = spawn(join(root, 'backend/.venv/bin/uvicorn'), ['app.main:app', '--host', '127.0.0.1', '--port', String(port)], {
     cwd: join(root, 'backend'),
-    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base, TRASH_ROOT: trashDir, VAULT_LABEL: 'OMNI', SNAPSHOT_ROOT: snapDir, AI_BACKGROUND: '0' },
+    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base, TRASH_ROOT: trashDir, VAULT_LABEL: 'OMNI', SNAPSHOT_ROOT: snapDir, AI_BACKGROUND: '0', SEISAKU_ROOT: seisakuDir },
     stdio: 'ignore',
   })
   return waitFor(async () => (await fetch(base + '/api/health').catch(() => null))?.ok)
@@ -487,6 +498,26 @@ try {
   await page.unroute('**/api/ai/status')
   await page.unroute('**/api/ai/tidy')
   await page.screenshot({ path: join(work, 'desktop.png') })
+
+  // 制作カレンダー: 制作ログの写真が日に並び、日を押すとその日の記録。メモを作る・つなぐ
+  await page.goto(base + '/#/')
+  await page.reload()
+  await page.click('.side-nav button:has-text("制作カレンダー")')
+  await page.waitForSelector('.cal-cell.today .cal-thumbs img')
+  check(await page.waitForFunction(() => { const i = document.querySelector('.cal-cell.today .cal-thumbs img'); return i && i.complete && i.naturalWidth > 0 }, null, { timeout: 8000 }).then(() => true, () => false), '制作カレンダー: その日の制作ログの写真が、月の格子に出る')
+  check((await page.textContent('.day-panel')).includes('キーボードの試作') && (await page.textContent('.day-panel')).includes('左手だけで打てるように'), '日を押すと、その日の制作ログ(タイトル・作った意図)が出る')
+  await page.click('.log-card .chip:has-text("この制作のメモを作る")')
+  await page.waitForFunction(() => document.querySelector('.document-title')?.value === 'キーボードの試作')
+  const sm = read('めも/キーボードの試作.md')
+  check(sm.startsWith(`---\ndate: '${T}'\n制作ログ: '${LOG_ID}'\n---\n\n#ものづくり\n`) && sm.includes('## 使うときは') && sm.includes('## 使っている鍵・アカウント'), '「この制作のメモを作る」: 制作ログにつながったひな形のメモ(作り方・URL・鍵の場所)')
+  check(await page.waitForSelector('.seisaku-strip img', { timeout: 8000 }).then(() => true, () => false), '制作ログにつながったメモには、タイトルの下に写真が出る')
+  await page.click('.seisaku-strip .chip')
+  await page.waitForSelector('.log-card .chip.on:has-text("キーボードの試作")')
+  check(true, 'メモの「制作ログ」から、その日のカレンダーへ戻れる(つながっているメモが出る)')
+  await page.click('.log-card .chip:has-text("メモをつなぐ")')
+  await page.fill('.modal .field-input', 'ホームから書いた')
+  await page.click('.modal .day-memo:has-text("ホームから書いた")')
+  check(await waitFor(() => read('めも/ホームから書いた.md').includes(`制作ログ: '${LOG_ID}'`), 10000), '「メモをつなぐ」: 前からあるメモに制作ログのプロパティを足す')
 
   // スマホ幅: 一覧は閉じていて、開いてノートを選ぶと閉じる
   const m = await browser.newPage({ viewport: { width: 390, height: 844 } })

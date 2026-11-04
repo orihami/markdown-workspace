@@ -415,3 +415,73 @@ def test_auto_skips_settings_notes(brainy, vault):
         old = time.time() - 20 * 60
         os.utime(p, (old, old))
     assert brainy.auto_candidates(time.time()) == []
+
+
+# ---- 講義棚の課題 → めも のタスク ----
+
+def test_kogi_sync(client, vault, tmp_path, monkeypatch):
+    import json, time
+    from app import kogi
+    (vault / "めも").mkdir(exist_ok=True)
+    now_ms = int(time.time() * 1000)
+    day = 86400000
+    ev = {
+        "a@x": {"uid": "a@x", "summary": "「提出：§27の章末問題(上にあるレポート用紙…upload提出)」の提出期限", "category": "2026_99F2130", "start": now_ms + 2 * day, "removed": False},
+        "b@x": {"uid": "b@x", "summary": "「提出：昔の課題」の提出期限", "category": "", "start": now_ms - 30 * day, "removed": False},
+        "c@x": {"uid": "c@x", "summary": "「提出：済んだ課題」の提出期限", "category": "", "start": now_ms + day, "removed": False, "done": True},
+        "m1": {"uid": "m1", "source": "manual", "summary": "心理学のレポート", "course": "心理学", "start": now_ms + 3 * day, "description": "A4 2枚"},
+    }
+    f = tmp_path / "deadlines.json"
+    f.write_text(json.dumps({"events": ev}), encoding="utf-8")
+    st = tmp_path / "settings.json"
+    st.write_text(json.dumps({"term_courses": {"2026-second": ["電気回路2", "心理学"]}}), encoding="utf-8")
+    monkeypatch.setattr(kogi, "DEADLINES", f)
+    monkeypatch.setattr(kogi, "SETTINGS", st)
+    s0 = client.get("/api/kogi").json()
+    assert s0["courses"] == ["電気回路2", "心理学"] and s0["codes"] == [{"code": "2026_99F2130", "count": 1, "course": ""}] and s0["waiting"] == 1
+    assert client.post("/api/kogi/sync").json()["created"] == 1  # 授業の番号のままの課題は、授業名を選ぶまで作らない
+    assert not list((vault / "めも").glob("§27*"))
+    client.post("/api/kogi/map", json={"code": "2026_99F2130", "course": "電気回路2"})
+    assert client.post("/api/kogi/sync").json() == {"created": 1, "updated": 0}  # 昔の課題・済んだ課題は作らない
+    t = (vault / "めも" / "§27の章末問題(電気回路2).md").read_text(encoding="utf-8")
+    assert t.startswith("---\n遂行日: ") and "完了: false" in t and "講義棚: 'a@x'" in t and "\n\n#課題 #学校\n\n" in t and "授業: 電気回路2" in t
+    assert "A4 2枚" in (vault / "めも" / "心理学のレポート(心理学).md").read_text(encoding="utf-8")
+    assert client.post("/api/kogi/sync").json() == {"created": 0, "updated": 0}  # 2回目は作らない
+    # 講義棚で締切が動いた・済みにした → 合わせる
+    ev["a@x"]["start"] = now_ms + 5 * day
+    ev["a@x"]["done"] = True
+    f.write_text(json.dumps({"events": ev}), encoding="utf-8")
+    assert client.post("/api/kogi/sync").json()["updated"] == 1
+    t2 = (vault / "めも" / "§27の章末問題(電気回路2).md").read_text(encoding="utf-8")
+    assert "完了: true" in t2 and t2.split("\n")[1] != t.split("\n")[1] and "授業: 電気回路2" in t2
+    item = next(i for i in client.get("/api/tree").json()["items"] if i["path"] == "めも/心理学のレポート(心理学).md")
+    assert item["task"] and item["deadline"]
+
+
+# ---- 制作ログ ----
+
+def test_seisaku_logs(client, vault, tmp_path, monkeypatch):
+    import json
+    from app import seisaku
+    root = tmp_path / "制作ログ"
+    d = root / "2026" / "11" / "2026-11-03" / "aaaaaaaa-1111-2222-3333-444444444444"
+    d.mkdir(parents=True)
+    (d / "01_x.jpg").write_bytes(PNG)
+    (d / "thumb_01_x.jpg").write_bytes(PNG)
+    (d / "02_gone.jpg").write_bytes(PNG)
+    (d / "log.json").write_text(json.dumps({"id": "aaaaaaaa-1111-2222-3333-444444444444", "date": "2026-11-03", "title": "キーボードの試作", "intention": "左手だけ", "memo": "", "photos": [{"name": "01_x.jpg"}, {"name": "02_gone.jpg", "deleted": True}], "createdAt": 1}), encoding="utf-8")
+    legacy = root / "2026" / "11" / "2026-11-01"
+    legacy.mkdir(parents=True)
+    (legacy / "old.jpg").write_bytes(PNG)
+    monkeypatch.setattr(seisaku, "ROOT", root)
+    items = client.get("/api/seisaku", params={"month": "2026-11"}).json()["items"]
+    assert [i["id"] for i in items] == ["legacy-2026-11-01", "aaaaaaaa-1111-2222-3333-444444444444"]
+    log = items[1]
+    assert log["title"] == "キーボードの試作" and len(log["photos"]) == 1 and log["photos"][0]["thumb"].endswith("thumb_01_x.jpg")
+    assert client.get("/api/seisaku/photo", params={"path": log["photos"][0]["full"]}).content == PNG
+    assert client.get("/api/seisaku/photo", params={"path": "../secret.jpg"}).status_code == 404
+    assert client.get("/api/seisaku/log/aaaaaaaa-1111-2222-3333-444444444444").json()["title"] == "キーボードの試作"
+    (vault / "めも").mkdir(exist_ok=True)
+    (vault / "めも" / "作り方.md").write_text("---\ndate: '2026-11-03'\n制作ログ: 'aaaaaaaa-1111-2222-3333-444444444444'\n---\n\n本文\n", encoding="utf-8")
+    item = next(i for i in client.get("/api/tree").json()["items"] if i["path"] == "めも/作り方.md")
+    assert item["seisaku"] == "aaaaaaaa-1111-2222-3333-444444444444"

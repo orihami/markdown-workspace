@@ -471,3 +471,76 @@ input, textarea { caret-color: var(--accent); }
 .auto-row small { flex: none; font-size: 11.5px; color: var(--faint); white-space: nowrap; }
 .auto-undo { flex: none; border: 0; background: transparent; color: var(--muted); font-size: 12px; padding: 2px 6px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
 .auto-undo:hover { background: var(--side); color: var(--ink); }
+.settings-row.block { flex-direction: column; align-items: stretch; }
+.kogi-map { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12.5px; padding: 3px 0; }
+.kogi-map span { font-family: var(--mono); color: var(--ink-2); }
+.kogi-map small { margin-left: 6px; color: var(--faint); font-family: var(--sans); }
+.settings-popover { max-height: calc(100vh - 80px); overflow: auto; }
+.task-line .deadline { color: var(--ink-2); font-weight: 600; }
+
+/* 左の一覧: ホーム・制作カレンダー */
+.side-nav { display: flex; flex-direction: column; gap: 1px; margin: 0 0 8px; }
+.side-nav button { display: flex; align-items: center; gap: 8px; border: 0; background: transparent; padding: 7px 8px; border-radius: 7px; font-size: 14px; color: var(--ink-2); cursor: pointer; text-align: left; }
+.side-nav button:hover { background: var(--side-2); }
+.side-nav button.on { background: #fff; color: var(--ink); font-weight: 600; box-shadow: inset 2px 0 0 var(--accent); }
+.side-nav svg { color: var(--muted); }
+
+/* 制作カレンダー */
+.seisaku { max-width: 980px; margin: 0 auto; padding: 18px 28px 120px; }
+.seisaku-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.seisaku-head h1 { margin: 0; font-size: 26px; letter-spacing: -0.02em; }
+.seisaku-nav { display: flex; align-items: center; gap: 6px; }
+.seisaku-nav b { font-size: 16px; min-width: 110px; text-align: center; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); border-top: 1px solid var(--line); border-left: 1px solid var(--line); background: #fff; border-radius: 12px; overflow: hidden; }
+.cal-week { text-align: center; font-size: 11.5px; font-weight: 700; color: var(--muted); padding: 6px 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--side); }
+.cal-cell { position: relative; display: flex; flex-direction: column; align-items: stretch; gap: 3px; min-height: 92px; padding: 4px; border: 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); background: #fff; text-align: left; cursor: pointer; }
+.cal-cell:hover { background: #fcfbf8; }
+.cal-cell.other { background: var(--paper); }
+.cal-cell.other .cal-day, .cal-cell.other img { opacity: 0.45; }
+.cal-cell.selected { box-shadow: inset 0 0 0 2px var(--accent); }
+.cal-day { font-size: 12px; font-weight: 600; color: var(--ink-2); font-variant-numeric: tabular-nums; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; }
+.cal-cell.today .cal-day { background: var(--accent); color: #fff; }
+.cal-thumbs { display: flex; gap: 2px; align-items: center; }
+.cal-thumbs img { width: calc(50% - 1px); aspect-ratio: 1; object-fit: cover; border-radius: 5px; }
+.cal-thumbs em { position: absolute; right: 6px; top: 6px; font-style: normal; font-size: 10.5px; color: var(--muted); }
+.cal-dots { display: flex; gap: 3px; margin-top: auto; }
+.dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+.dot.link { background: var(--accent); }
+.dot.memo { background: var(--faint); }
+.day-panel { margin-top: 18px; }
+.day-panel h2 { font-size: 18px; margin: 0 0 10px; }
+.log-card { background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 12px; margin-bottom: 10px; }
+.log-photos { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; scrollbar-width: thin; }
+.log-photos button { flex: none; border: 0; padding: 0; background: transparent; cursor: zoom-in; }
+.log-photos img { height: 120px; width: auto; max-width: 200px; object-fit: cover; border-radius: 10px; display: block; }
+.log-text { margin: 10px 2px 4px; display: flex; flex-direction: column; gap: 4px; font-size: 14.5px; line-height: 1.7; }
+.log-text b { font-size: 16px; }
+.log-text p { margin: 0; color: var(--ink-2); white-space: pre-wrap; }
+.log-text small { display: block; font-size: 11px; font-weight: 700; color: var(--muted); }
+.log-links { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.log-links .chip { display: inline-flex; align-items: center; gap: 5px; }
+.day-memos { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; }
+.day-memos > small { font-size: 12px; font-weight: 700; color: var(--muted); padding: 4px 2px; }
+.day-memo { display: flex; justify-content: space-between; gap: 8px; border: 0; background: transparent; text-align: left; padding: 7px 6px; border-radius: 7px; font-size: 14px; cursor: pointer; color: var(--ink); }
+.day-memo:hover { background: var(--side); }
+.day-memo:disabled { color: var(--faint); cursor: default; }
+.day-memo small { color: var(--faint); font-size: 11.5px; }
+.link-list { max-height: 50vh; overflow: auto; display: flex; flex-direction: column; }
+.field-input { font: inherit; font-size: 15px; padding: 9px 10px; border: 1px solid var(--line-2); border-radius: 9px; }
+.viewer { align-items: center; padding: 12px; background: rgba(20, 18, 15, 0.86); }
+.viewer img { max-width: 100%; max-height: 92vh; border-radius: 8px; }
+.viewer-prev, .viewer-next, .viewer-close { position: fixed; border: 0; background: rgba(255, 255, 255, 0.14); color: #fff; border-radius: 999px; width: 44px; height: 44px; display: grid; place-items: center; cursor: pointer; }
+.viewer-prev { left: 12px; top: 50%; }
+.viewer-next { right: 12px; top: 50%; }
+.viewer-close { right: 12px; top: 12px; }
+.seisaku-strip { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 4px; }
+.seisaku-strip .chip { align-self: flex-start; }
+.seisaku-strip .log-photos img { height: 90px; }
+@media (max-width: 760px) {
+  .seisaku { padding: 8px 10px 100px; }
+  .seisaku-head h1 { font-size: 21px; }
+  .cal-cell { min-height: 64px; padding: 2px; }
+  .cal-thumbs img { width: 100%; }
+  .cal-thumbs img:nth-child(2) { display: none; }
+  .log-photos img { height: 96px; }
+}

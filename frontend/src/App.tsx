@@ -3,7 +3,7 @@ import CodeMirror, { ReactCodeMirrorRef } from '@uiw/react-codemirror'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorView, keymap } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
-import { AlertTriangle, Check, ChevronRight, Sparkles, CircleDot, CloudOff, FilePlus2, Hash, ListChecks, Loader2, Menu, MoreHorizontal, Plus, Search, Settings2, Star, Trash2, Wifi, WifiOff, X } from 'lucide-react'
+import { AlertTriangle, CalendarDays, Check, ChevronRight, Home, Sparkles, CircleDot, CloudOff, FilePlus2, Hash, ListChecks, Loader2, Menu, MoreHorizontal, Plus, Search, Settings2, Star, Trash2, Wifi, WifiOff, X } from 'lucide-react'
 import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
 import { engine, SaveStatus, STATUS_LABEL } from './sync'
 import { livePreview, LiveMode, pasteImages } from './livePreview'
@@ -11,6 +11,7 @@ import { slashSource, workspaceCompletions } from './completions'
 import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, TidyApply, TidyDialog, useKeyboardInset, VersionsDialog, AskDialog, AskPanel } from './components'
 import { applyChanges, Change, cleanName, inMemoFolder, makeTask, removeProp, setTags as setTagLine, tagLine, MEMO_FOLDER, nameFromBody, newNoteContent, parseFront, propValue, setProp, SortName, sortNotes, SORTS, today } from './memo'
 import { uuid } from './uuid'
+import { SeisakuCalendar, SeisakuLog, SeisakuStrip, seisakuTemplate } from './seisaku'
 import { findDate, nextOccurrence, REPEATS, shortDay, TASK_WORDS } from './jdate'
 
 // 表示(仕様 4.3)。どれも同じエディタで直接書き、ファイルの中身は変えない(見た目だけ)
@@ -71,6 +72,8 @@ export default function App() {
   const [settings, setSettings] = useState(false)
   const [diff, setDiff] = useState<{ mine: string; server: string } | null>(null)
   const [versionsOpen, setVersionsOpen] = useState(false)
+  // ノートを開いていないときに見るもの: ホーム か 制作カレンダー
+  const [view, setView] = useState<{ kind: 'home' | 'calendar'; day?: string }>({ kind: 'home' })
   const [tidyOpen, setTidyOpen] = useState(false)
   const [aiOn, setAiOn] = useState(false)
   const [aiSpent, setAiSpent] = useState<{ spent: number; cap: number } | null>(null)
@@ -80,6 +83,9 @@ export default function App() {
   const [askDialog, setAskDialog] = useState<string | null>(null)
   // 自動で整えたメモ(ホームに出して、元に戻せる)
   const [auto, setAuto] = useState<{ enabled: boolean; items: { id: number; path_before: string; path: string; tags: string[]; tasks: string[]; at: string; undone: boolean }[] }>({ enabled: true, items: [] })
+  // 講義棚の課題(授業の番号 → 授業名)
+  const [kogiInfo, setKogiInfo] = useState<{ configured: boolean; events: number; synced: number; waiting: number; courses: string[]; codes: { code: string; count: number; course: string }[] } | null>(null)
+  useEffect(() => { api<NonNullable<typeof kogiInfo>>('/api/kogi').then(setKogiInfo).catch(() => {}) }, [])
   const [indexInfo, setIndexInfo] = useState<{ notes: number; chunks: number; updated_at: string | null } | null>(null)
   const [autoOpen, setAutoOpen] = useState(false)
   const autoRecent = auto.items.filter((a) => !a.undone && Date.now() - new Date(a.at).getTime() < 3 * 86400000).slice(0, 8)
@@ -515,6 +521,35 @@ export default function App() {
     }
   }
 
+  // ホーム・制作カレンダーへ(開いているノートは閉じる。書いた分は保存係が送る)
+  const leaveNote = () => {
+    openSeq.current++
+    docPathRef.current = ''
+    setDraft(null)
+    setActive('')
+    setDoc(null)
+    if (hashPath()) history.pushState(null, '', '#/')
+    if (isMobile()) setSidebarOpen(false)
+  }
+  const goHome = () => { leaveNote(); setView({ kind: 'home' }) }
+  const openCalendar = (day?: string) => { leaveNote(); setView({ kind: 'calendar', day }) }
+  // 制作ログ → 「この制作のメモを作る」(ひな形)・「メモをつなぐ」(プロパティ「制作ログ: 記録のID」を足す)
+  const createSeisakuMemo = async (log: SeisakuLog) => {
+    const folder = memoFolder()
+    const name = uniqueName(folder, cleanName(log.title) || `制作 ${log.date}`)
+    const path = `${folder ? folder + '/' : ''}${name}.md`
+    try {
+      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content: seisakuTemplate(log) }) })
+    } catch (e) { setToast({ text: `作れませんでした: ${(e as ApiError).message}` }); return }
+    await loadTree()
+    await openNote(path)
+  }
+  const linkSeisaku = async (log: SeisakuLog, path: string) => {
+    const n = notesRef.current.find((x) => x.path === path)
+    if (!n) return
+    if (await updateTask(n, (t) => setProp(t, '制作ログ', `'${log.id}'`), { seisaku: log.id })) setToast({ text: `「${n.name}」を ${log.date.slice(5).replace('-', '/')} の制作ログにつなぎました` })
+  }
+
   // タスクを開かずに書きかえる(そのノートを開いていればエディタから。そうでなければ読んで、変えて、保存する)
   const updateTask = async (n: Note, fn: (text: string) => Change[], local: Partial<Note>) => {
     try {
@@ -897,6 +932,7 @@ export default function App() {
   const done = /^true$/i.test(propValue(head, '完了')?.value || '')
   const taskDay = propValue(head, '遂行日')?.value || ''
   const repeat = propValue(head, 'くり返し')?.value || ''
+  const deadline = propValue(head, '締切')?.value || ''
 
   return (
     <div className="app-shell">
@@ -908,6 +944,10 @@ export default function App() {
             <button className="side-new" onClick={() => openNewNote()} aria-label="新しいメモ・タスク" title="新しいメモ・タスク(Alt+N)"><Plus size={18} /></button>
           </div>
           <div className="side-scroll">
+            <nav className="side-nav">
+              <button className={!doc && view.kind === 'home' ? 'on' : ''} onClick={goHome}><Home size={15} /> ホーム</button>
+              <button className={!doc && view.kind === 'calendar' ? 'on' : ''} onClick={() => openCalendar()}><CalendarDays size={15} /> 制作カレンダー</button>
+            </nav>
             {favs.length > 0 && <section className="side-sec">
               <div className="side-head"><Star size={12} /> お気に入り</div>
               {favs.map((f) => {
@@ -1014,6 +1054,7 @@ export default function App() {
                 <label>遂行日<input type="date" value={/^\d{4}-\d{2}-\d{2}/.test(taskDay) ? taskDay.slice(0, 10) : ''} onChange={(e) => e.target.value && editHead(setProp(contentRef.current, '遂行日', e.target.value))} aria-label="遂行日" /></label>
                 {!done && taskDay && taskDay < today() && <span className="late">期限を過ぎています</span>}
                 {!done && taskDay === today() && <span className="today">今日</span>}
+                {deadline && <span className="deadline">締切 {deadline.slice(5).replace('-', '/')}</span>}
                 <label className="repeat">くり返し
                   <select value={repeat} onChange={(e) => editHead(e.target.value ? setProp(contentRef.current, 'くり返し', e.target.value) : removeProp(contentRef.current, 'くり返し'))} aria-label="くり返し">
                     <option value="">なし</option>
@@ -1021,6 +1062,7 @@ export default function App() {
                   </select>
                 </label>
               </div>}
+              {!draft && propValue(head, '制作ログ')?.value && <SeisakuStrip logId={propValue(head, '制作ログ')!.value} onDay={(d) => openCalendar(d)} />}
               {!draft && <NoteMeta
                 text={head}
                 memo={inMemoFolder(active)}
@@ -1048,7 +1090,7 @@ export default function App() {
                 </div>}
               </div>
             </article>
-          </> : <div className="home">
+          </> : view.kind === 'calendar' ? <SeisakuCalendar notes={notes} initialDay={view.day} onOpen={(p) => void openNote(p)} onCreate={(l) => void createSeisakuMemo(l)} onLink={(l, p) => void linkSeisaku(l, p)} /> : <div className="home">
             {notice && <div className="notice">{notice}<button onClick={() => setNotice('')} aria-label="閉じる"><X size={14} /></button></div>}
             <p className="home-date">{new Date().toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' })}</p>
             <h1 className="home-hello">{greeting()}</h1>
@@ -1088,7 +1130,7 @@ export default function App() {
                   <div key={n.path} className={`task-row ${n.done ? 'done' : ''}`}>
                     <input type="checkbox" checked={!!n.done} onChange={(e) => void setTaskDone(n, e.target.checked)} aria-label={`${n.name} を完了にする`} />
                     <button onClick={() => void openNote(n.path)}>{n.name}</button>
-                    <small className={n.task_day! < today() ? 'late' : n.task_day === today() ? 'today' : ''}>{n.repeat ? '↻ ' : ''}{n.task_day! < today() ? '期限すぎ ' : n.task_day === today() ? '今日' : ''}{n.task_day === today() ? '' : n.task_day!.slice(5).replace('-', '/')}</small>
+                    <small className={n.task_day! < today() ? 'late' : n.task_day === today() ? 'today' : ''}>{n.repeat ? '↻ ' : ''}{n.task_day! < today() ? '期限すぎ ' : n.task_day === today() ? '今日' : ''}{n.task_day === today() ? '' : n.task_day!.slice(5).replace('-', '/')}{n.deadline && /\d{2}:\d{2}/.test(n.deadline) ? ' ' + n.deadline.slice(-5) : ''}</small>
                     <span className="task-move">
                       {n.task_day !== today() && <button onClick={() => void moveTask(n, today())} title="今日にする">今日</button>}
                       <button onClick={() => { const d = new Date(); d.setDate(d.getDate() + 1); void moveTask(n, today(d)) }} title="明日にする">明日</button>
@@ -1130,6 +1172,7 @@ export default function App() {
             <div className="home-more">
               <button className="btn" onClick={() => openNewNote()}><FilePlus2 size={15} /> 広い画面で書く</button>
               <button className="btn" onClick={() => setSwitcher('')}><Search size={15} /> 探す</button>
+              <button className="btn" onClick={() => openCalendar()}><CalendarDays size={15} /> 制作カレンダー</button>
             </div>
           </div>}
         </main>
@@ -1142,6 +1185,12 @@ export default function App() {
         <div className="settings-row"><div><strong>送信待ち</strong><small>端末に残っていて、サーバーの確認がまだのもの</small></div><span className="setting-value">{pending}件 {pending > 0 && <button className="btn tiny" onClick={() => engine.saveNow()}>今すぐ送る</button>}</span></div>
         {aiOn && <div className="settings-row"><div><strong>AI が自動で整える</strong><small>15分さわっていないタグなしの雑記に、タグ・期限つきのタスク・(自動で付いた名前なら)名前を。本文は変えない</small></div><input type="checkbox" checked={auto.enabled} onChange={(e) => api<typeof auto>('/api/ai/auto', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }).then(setAuto).catch(() => {})} aria-label="AI が自動で整える" /></div>}
         {aiOn && <div className="settings-row"><div><strong>AI(今月)</strong><small>{aiSpent ? `${aiSpent.spent.toFixed(1)}円 / 上限 ${aiSpent.cap.toFixed(0)}円(なんでも博士と同じクレジット)` : ''}{indexInfo ? ` · 索引 ${indexInfo.notes}件` : ''}</small></div><button className="btn tiny" onClick={() => { void api('/api/ai/index', { method: 'POST' }); api<typeof indexInfo>('/api/ai/index').then(setIndexInfo).catch(() => {}) }}>索引を更新</button></div>}
+        {kogiInfo?.configured && <div className="settings-row block"><div><strong>講義棚の課題</strong><small>講義棚が Moodle から取った課題を、めも のタスクにします(5分ごと。いままで {kogiInfo.synced}件)。授業の番号の課題は、授業名を選ぶと取りこみます{kogiInfo.waiting ? `(待っている課題 ${kogiInfo.waiting}件)` : ''}</small></div>
+          {kogiInfo.codes.map((c) => <label key={c.code} className="kogi-map"><span>{c.code}<small>{c.count}件</small></span>
+            <select value={c.course} onChange={(e) => api<NonNullable<typeof kogiInfo>>('/api/kogi/map', { method: 'POST', body: JSON.stringify({ code: c.code, course: e.target.value }) }).then(setKogiInfo).catch(() => {})}>
+              <option value="">(選ぶ)</option>{kogiInfo.courses.map((k) => <option key={k} value={k}>{k}</option>)}
+            </select></label>)}
+        </div>}
         <div className="settings-row"><div><strong>キー</strong><small>Ctrl+K 探す · Alt+N 新しいメモ · Ctrl+S すぐ保存 · Ctrl+E ソース · / 候補 · [[ リンク</small></div></div>
       </div>}
 

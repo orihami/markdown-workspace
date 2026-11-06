@@ -1,6 +1,6 @@
 {
-  "name": "memo workspace",
-  "short_name": "memo",
+  "name": "めも",
+  "short_name": "めも",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#fbfaf7",
@@ -10,6 +10,22 @@
       "src": "/icon.svg",
       "sizes": "any",
       "type": "image/svg+xml"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
     }
   ],
   "share_target": {
@@ -29,5 +45,43 @@
         }
       ]
     }
-  }
+  },
+  "shortcuts": [
+    {
+      "name": "メモを書く",
+      "short_name": "メモ",
+      "url": "/?go=memo",
+      "icons": [
+        {
+          "src": "/sc-memo.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "タスクを追加",
+      "short_name": "タスク追加",
+      "url": "/?go=task",
+      "icons": [
+        {
+          "src": "/sc-task.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "タスク一覧",
+      "short_name": "タスク",
+      "url": "/?go=tasks",
+      "icons": [
+        {
+          "src": "/sc-list.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    }
+  ]
 }

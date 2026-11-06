@@ -12,7 +12,7 @@ export type Outbox = {
   updatedAt: number
 }
 
-const dbPromise = openDB('markdown-workspace', 2, {
+const dbPromise = openDB('markdown-workspace', 3, {
   async upgrade(db, oldVersion, _new, tx) {
     if (oldVersion < 1) {
       db.createObjectStore('drafts', { keyPath: 'path' })
@@ -38,6 +38,11 @@ const dbPromise = openDB('markdown-workspace', 2, {
       }
       db.deleteObjectStore('queue')
       db.deleteObjectStore('drafts')
+    }
+    if (oldVersion < 3) {
+      // 端末に持つ写し(つながらないときに読む・書く用)と、最後に受けとった一覧
+      db.createObjectStore('copies', { keyPath: 'path' })
+      db.createObjectStore('meta')
     }
   },
 })
@@ -65,4 +70,36 @@ export async function clearOutbox(path: string, mutationId: string) {
 
 export async function dropOutbox(path: string) {
   await (await dbPromise).delete('outbox', path)
+}
+
+// ---- 端末に持つ写し(めも の全部と、開いたことのあるノート) ----
+export type Copy = { path: string; content: string; etag: string }
+
+export async function getCopy(path: string) {
+  return (await (await dbPromise).get('copies', path)) as Copy | undefined
+}
+
+export async function putCopy(item: Copy) {
+  await (await dbPromise).put('copies', item)
+}
+
+export async function listCopies() {
+  return (await (await dbPromise).getAll('copies')) as Copy[]
+}
+
+// まとめて入れかえる(サーバーから届いた差分)
+export async function applyCopies(changed: Copy[], removed: string[]) {
+  const db = await dbPromise
+  const tx = db.transaction('copies', 'readwrite')
+  for (const c of changed) await tx.store.put(c)
+  for (const p of removed) await tx.store.delete(p)
+  await tx.done
+}
+
+export async function getMeta<T>(key: string) {
+  return (await (await dbPromise).get('meta', key)) as T | undefined
+}
+
+export async function putMeta(key: string, value: unknown) {
+  await (await dbPromise).put('meta', value, key)
 }

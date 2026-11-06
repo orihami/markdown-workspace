@@ -46,6 +46,8 @@ writeFileSync(join(snapDir, '2026-10-20', 'はじめに.md'), '# はじめに\n\
 const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
 const port = 18000 + Math.floor(Math.random() * 1000)
 const base = `http://127.0.0.1:${port}`
+// Service Worker は 127.0.0.1 では使わない(main.tsx)。つながらないときの確かめだけ localhost で開く
+const lbase = `http://localhost:${port}`
 const read = (p) => readFileSync(join(vault, p), 'utf8')
 let failed = false
 const check = (ok, msg) => { console.log((ok ? 'OK   ' : 'NG   ') + msg); if (!ok) failed = true }
@@ -54,7 +56,7 @@ let apiProc
 function startApi() {
   apiProc = spawn(join(root, 'backend/.venv/bin/uvicorn'), ['app.main:app', '--host', '127.0.0.1', '--port', String(port)], {
     cwd: join(root, 'backend'),
-    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: base, TRASH_ROOT: trashDir, VAULT_LABEL: 'OMNI', SNAPSHOT_ROOT: snapDir, AI_BACKGROUND: '0', SEISAKU_ROOT: seisakuDir },
+    env: { ...process.env, VAULT_ROOT: vault, WORKSPACE_DB: join(work, 'state.sqlite3'), ALLOWED_ORIGINS: `${base},${lbase}`, TRASH_ROOT: trashDir, VAULT_LABEL: 'OMNI', SNAPSHOT_ROOT: snapDir, AI_BACKGROUND: '0', SEISAKU_ROOT: seisakuDir },
     stdio: 'ignore',
   })
   return waitFor(async () => (await fetch(base + '/api/health').catch(() => null))?.ok)
@@ -541,6 +543,55 @@ try {
   await m.keyboard.type('スマホから')
   check(await waitFor(() => read('sub/メモ.md').includes('- [ ] スマホから'), 10000), 'スマホ: 操作列の ☑ でチェックリストになる')
   await m.screenshot({ path: join(work, 'mobile.png') })
+
+  // ---- OMNI メモの役目: タスクの画面・ホーム画面のショートカット・つながらないときも読めて書ける ----
+  const o = await browser.newPage({ viewport: { width: 390, height: 844 } })
+  o.on('pageerror', (e) => errors.push(e.message))
+  await o.route(/fonts\./, (r) => r.abort())
+  await o.goto(base + '/?go=task')
+  await o.waitForSelector('.tasks-page')
+  check(await o.evaluate(() => document.activeElement?.getAttribute('aria-label') === 'タスクを追加'), 'ショートカット ?go=task: タスクの画面で追加の欄にすぐ書ける')
+  check(!(await o.evaluate(() => location.search)), 'ショートカットの印(?go=)は URL から消す')
+  await o.fill('.task-add input', '小テスト勉強 明日')
+  await o.press('.task-add input', 'Enter')
+  check(await waitFor(() => existsSync(join(vault, 'めも', '小テスト勉強.md')) && read('めも/小テスト勉強.md').includes(`遂行日: ${dayAfter(1)}`), 10000), 'タスクの画面: 「小テスト勉強 明日」→ 名前「小テスト勉強」・遂行日は明日')
+  await o.click('.task-filters .chip:has-text("今日")')
+  const days = await o.locator('.task-row small').allTextContents()
+  check(days.length > 0 && days.every((d) => d.includes('今日')), 'タスクの画面: 「今日」でしぼる')
+  await o.click('.task-filters .chip:has-text("未完了")')
+  check(await o.isVisible('.task-group:has-text("今日")') && await o.isVisible('.task-group:has-text("これから")'), 'タスクの画面: 今日・これから… にまとまる')
+  await o.locator('.task-row', { hasText: '期限切れの課題' }).locator('.task-pick input').fill(dayAfter(3))
+  check(await waitFor(() => read('めも/期限切れの課題.md').includes(`遂行日: ${dayAfter(3)}`), 10000), 'タスクの画面: 📅 で日付を選んで変える')
+  await o.click('input[aria-label="小テスト勉強 を完了にする"]')
+  check(await waitFor(() => read('めも/小テスト勉強.md').includes('完了: true'), 10000), 'タスクの画面: 開かずに完了にする')
+  const mf = JSON.parse(readFileSync(join(root, 'frontend/dist/manifest.webmanifest'), 'utf8'))
+  check(mf.shortcuts?.map((x) => x.url).join() === '/?go=memo,/?go=task,/?go=tasks' && mf.icons.some((i) => i.sizes === '512x512'), 'ホーム画面のショートカット(メモ・タスク追加・タスク一覧)と PNG のアイコン')
+
+  // 端末の写し: めも の全部を受けとるまで待つ
+  await o.goto(lbase + '/')
+  check(await waitFor(() => o.evaluate(() => new Promise((res) => { const r = indexedDB.open('markdown-workspace'); r.onsuccess = () => { const q = r.result.transaction('copies').objectStore('copies').count(); q.onsuccess = () => res(q.result >= 6) } })), 15000), '端末の写し: めも を全部この端末に持つ')
+  check(await waitFor(() => o.evaluate(async () => !!navigator.serviceWorker.controller && (await caches.keys()).length > 0 && (await (await caches.open((await caches.keys())[0])).keys()).some((r) => r.url.includes('/assets/'))), 15000), 'オフライン用に画面の部品を端末に覚える')
+  await stopApi()
+  // つながらない: 一覧は覚えた分、ノートは写しから開いて書ける
+  await o.reload()
+  await o.waitForSelector('.capture-editor .cm-content', { timeout: 15000 })
+  await o.click('.capture-editor .cm-content')
+  await o.keyboard.type('電車で思いついたこと')
+  await o.click('button:has-text("めもに残す")')
+  check(await waitFor(() => o.isVisible('.toast:has-text("端末に残しました")'), 5000), 'つながらない: すぐ書く欄の内容を端末に残す')
+  await o.click('button[aria-label="一覧を開く・閉じる"]')
+  await o.locator('.note-item').filter({ hasText: /^新しいメモ/ }).first().click()
+  await o.waitForFunction(() => document.querySelector('.document-title')?.value === '新しいメモ', null, { timeout: 10000 })
+  check(await o.isVisible('.notice:has-text("端末の写し")'), 'つながらない: ノートを端末の写しから開く')
+  await o.click('.cm-content')
+  await o.keyboard.press('Control+End')
+  await o.keyboard.type(' オフラインで追記')
+  await o.waitForTimeout(1200)
+  check(!read('めも/新しいメモ.md').includes('オフラインで追記'), 'つながらない間は、まだサーバーに書かない')
+  check(await startApi(), 'API を再起動(つながった)')
+  check(await waitFor(() => read('めも/新しいメモ.md').includes('オフラインで追記'), 40000), 'つながったら: 写しで書いた分を送る')
+  check(await waitFor(() => readdirSync(join(vault, 'めも')).some((f) => f.startsWith('電車で思いついたこと')), 40000), 'つながったら: 端末に残したメモを めも に作る')
+  await o.screenshot({ path: join(work, 'offline.png') })
   console.log('スクショ: ' + work)
   check(errors.length === 0, `ブラウザのエラーなし ${errors.slice(0, 3).join(' / ')}`)
 } catch (e) {

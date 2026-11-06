@@ -4,7 +4,7 @@
 //   3. サーバーが保存を確認したら送信待ちを消して「保存済み」。それまでは「保存済み」と出さない
 //   4. 届かなければ間隔をのばしながら送り直す。409(競合)は送り直さず、本人に選んでもらう
 import { api, ApiError, notePath } from './api'
-import { clearOutbox, dropOutbox, getOutbox, listOutbox, putOutbox } from './storage'
+import { clearOutbox, dropOutbox, getOutbox, listOutbox, putCopy, putOutbox } from './storage'
 import { uuid } from './uuid'
 
 export type SaveStatus = 'saved' | 'saving' | 'unsaved' | 'offline' | 'conflict' | 'error'
@@ -21,6 +21,8 @@ export const STATUS_LABEL: Record<SaveStatus, string> = {
 }
 
 const DEBOUNCE_MS = 600
+// まだサーバーに無いノート(つながらないときに作った)の送信待ちは、ベースの版の代わりにこの印を持つ
+export const NEW_NOTE = 'new'
 const RETRY_MIN = 1000
 const RETRY_MAX = 30000
 
@@ -89,9 +91,29 @@ export class SaveEngine {
       return { content: ob.content, restored: true }
     }
     if (ob) await dropOutbox(path) // 中身がサーバーと同じなら送る必要はない
+    if (serverEtag !== NEW_NOTE) void putCopy({ path, content: serverContent, etag: serverEtag }).catch(() => {})
     this.base.set(path, serverEtag)
     this.set(path, { status: 'saved' })
     return { content: serverContent, restored: false }
+  }
+
+  // つながらないときに作る: 送信待ちに入れておき、つながったらサーバーに作る
+  async create(path: string, content: string) {
+    this.base.set(path, NEW_NOTE)
+    const ob = { path, content, baseEtag: NEW_NOTE, mutationId: uuid(), updatedAt: Date.now() }
+    const prev = this.writes.get(path) ?? Promise.resolve()
+    const done = prev.then(() => putOutbox(ob))
+    this.writes.set(path, done)
+    await done
+    this.set(path, { status: navigator.onLine ? 'unsaved' : 'offline', message: '端末に残しました。つながりしだい作ります' })
+    this.schedule(path, 0)
+  }
+
+  // まだ送れていないノートと、競合のノート(開いていないノートの分も、ホームで知らせる)
+  troubles() {
+    const out: { path: string; status: SaveStatus }[] = []
+    for (const [path, v] of this.info) if (v.status !== 'saved' && v.status !== 'saving') out.push({ path, status: v.status })
+    return out
   }
 
   // 入力のたび(画面からすぐ呼ばれる。通信は待たない)
@@ -130,11 +152,12 @@ export class SaveEngine {
       if (!ob) return
       this.set(path, { status: 'saving' })
       try {
-        const res = await api<{ etag: string }>(notePath(path), {
+        const res = ob.baseEtag === NEW_NOTE ? await this.createOnServer(ob.path, ob.content) : await api<{ etag: string }>(notePath(path), {
           method: 'PUT',
           body: JSON.stringify({ content: ob.content, base_etag: ob.baseEtag, mutation_id: ob.mutationId }),
         })
         this.base.set(path, res.etag)
+        void putCopy({ path, content: ob.content, etag: res.etag }).catch(() => {})
         await clearOutbox(path, ob.mutationId)
         // 送っている間にさらに書いた分は、いま保存できた版をもとにして続けて送る
         const newer = await getOutbox(path)
@@ -161,6 +184,18 @@ export class SaveEngine {
     } finally {
       this.inflight.delete(path)
       if (this.again.delete(path)) this.schedule(path, 0)
+    }
+  }
+
+  // 端末で作ったノートをサーバーに作る。同じ名前があれば、中身が同じ(前に送れていた)ときだけ済みにし、ちがえば競合
+  private async createOnServer(path: string, content: string): Promise<{ etag: string }> {
+    try {
+      return await api<{ etag: string }>('/api/notes', { method: 'POST', body: JSON.stringify({ path, content }) })
+    } catch (e) {
+      if (!(e instanceof ApiError) || e.status !== 409) throw e
+      const cur = await api<{ content: string; etag: string }>(notePath(path))
+      if (cur.content === content) return { etag: cur.etag }
+      throw new ApiError('同じ名前のノートがサーバーにあります', 409, { server_content: cur.content, server_etag: cur.etag })
     }
   }
 

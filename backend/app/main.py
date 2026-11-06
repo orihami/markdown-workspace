@@ -230,6 +230,40 @@ def tree():
     return {"items": items}
 
 
+class OfflineRequest(BaseModel):
+    known: dict[str, str] = Field(default_factory=dict)  # 端末が持っている ノート → ETag
+
+
+@app.post("/api/offline", dependencies=[Depends(require_auth)])
+def offline_copy(body: OfflineRequest):
+    """端末に持たせる めも の写し(つながらないときも読めて書けるように)。端末と違うものだけ中身を返す"""
+    root = ensure_root()
+    folder = root / MEMO_DIR
+    changed, seen = [], set()
+    if folder.is_dir():
+        try:
+            for rel, path in iter_notes(folder):
+                rel = f"{MEMO_DIR}/{rel}"
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    continue
+                if len(data) > MAX_NOTE_BYTES:
+                    continue
+                seen.add(rel)
+                etag = etag_for(data)
+                if body.known.get(rel) == etag:
+                    continue
+                try:
+                    changed.append({"path": rel, "etag": etag, "content": data.decode("utf-8")})
+                except UnicodeDecodeError:
+                    continue
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail=f"Vault read failed: {exc}") from exc
+    removed = [p for p in body.known if p.startswith(MEMO_DIR + "/") and p not in seen]
+    return {"folder": MEMO_DIR, "changed": changed, "removed": removed}
+
+
 @app.get("/api/notes/{note_path:path}", dependencies=[Depends(require_auth)])
 def get_note(note_path: str):
     path = safe_note_path(note_path, must_exist=True)

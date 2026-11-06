@@ -485,3 +485,17 @@ def test_seisaku_logs(client, vault, tmp_path, monkeypatch):
     (vault / "めも" / "作り方.md").write_text("---\ndate: '2026-11-03'\n制作ログ: 'aaaaaaaa-1111-2222-3333-444444444444'\n---\n\n本文\n", encoding="utf-8")
     item = next(i for i in client.get("/api/tree").json()["items"] if i["path"] == "めも/作り方.md")
     assert item["seisaku"] == "aaaaaaaa-1111-2222-3333-444444444444"
+
+
+def test_offline_copy_sends_only_changes(client, vault):
+    (vault / "めも").mkdir()
+    (vault / "めも" / "x.md").write_text("---\ndate: '2026-11-06'\n---\n\nx\n", encoding="utf-8")
+    (vault / "めも" / "y.md").write_text("y\n", encoding="utf-8")
+    r = client.post("/api/offline", json={}).json()
+    assert {c["path"] for c in r["changed"]} == {"めも/x.md", "めも/y.md"}  # めも の外(a.md)は入れない
+    known = {c["path"]: c["etag"] for c in r["changed"]}
+    (vault / "めも" / "y.md").write_text("y2\n", encoding="utf-8")
+    known["めも/gone.md"] = "sha256:old"
+    r = client.post("/api/offline", json={"known": known}).json()
+    assert [c["path"] for c in r["changed"]] == ["めも/y.md"] and r["changed"][0]["content"] == "y2\n"
+    assert r["removed"] == ["めも/gone.md"]

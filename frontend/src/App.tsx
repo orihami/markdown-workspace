@@ -5,7 +5,10 @@ import { EditorView, keymap } from '@codemirror/view'
 import { Prec } from '@codemirror/state'
 import { AlertTriangle, CalendarDays, Check, ChevronRight, Home, Sparkles, CircleDot, CloudOff, FilePlus2, Hash, ListChecks, Loader2, Menu, MoreHorizontal, Plus, Search, Settings2, Star, Trash2, Wifi, WifiOff, X } from 'lucide-react'
 import { api, ApiError, Note, NoteResponse, notePath, TagCount } from './api'
-import { engine, SaveStatus, STATUS_LABEL } from './sync'
+import { engine, NEW_NOTE, SaveStatus, STATUS_LABEL } from './sync'
+import { copiesAt, noteFromText, offlineTree, rememberTree, syncCopies } from './offline'
+import { getCopy, listOutbox } from './storage'
+import { TasksView } from './tasks'
 import { livePreview, LiveMode, pasteImages } from './livePreview'
 import { slashSource, workspaceCompletions } from './completions'
 import { buildTree, DeleteDialog, DiffDialog, Dropdown, MenuItem, MobileBar, NoteMeta, QuickSwitcher, TextChange, Toast, TrashDialog, TrashItem, Tree, TidyApply, TidyDialog, useKeyboardInset, VersionsDialog, AskDialog, AskPanel } from './components'
@@ -57,6 +60,7 @@ export default function App() {
   const [notes, setNotes] = useState<Note[]>([])
   const [tags, setTags] = useState<TagCount[]>([])
   const [apiOk, setApiOk] = useState<boolean | null>(null)
+  const [copied, setCopied] = useState(0) // 端末の写しを最後に受けとった時刻
   const [online, setOnline] = useState(navigator.onLine)
   const [active, setActive] = useState('')
   const [doc, setDoc] = useState<{ path: string; content: string; seq: number } | null>(null)
@@ -73,7 +77,7 @@ export default function App() {
   const [diff, setDiff] = useState<{ mine: string; server: string } | null>(null)
   const [versionsOpen, setVersionsOpen] = useState(false)
   // ノートを開いていないときに見るもの: ホーム か 制作カレンダー
-  const [view, setView] = useState<{ kind: 'home' | 'calendar'; day?: string }>({ kind: 'home' })
+  const [view, setView] = useState<{ kind: 'home' | 'calendar' | 'tasks'; day?: string; add?: boolean }>({ kind: 'home' })
   const [tidyOpen, setTidyOpen] = useState(false)
   const [aiOn, setAiOn] = useState(false)
   const [aiSpent, setAiSpent] = useState<{ spent: number; cap: number } | null>(null)
@@ -176,10 +180,16 @@ export default function App() {
   const loadTree = useCallback(async () => {
     try {
       const r = await api<{ items: Note[] }>('/api/tree')
-      setNotes(r.items)
+      void rememberTree(r.items).catch(() => {})
+      // 端末で作って、まだ送れていないノートも一覧に出す
+      const fresh = (await listOutbox().catch(() => [])).filter((ob) => ob.baseEtag === NEW_NOTE && !r.items.some((n) => n.path === ob.path))
+      setNotes([...r.items, ...fresh.map((ob) => noteFromText(ob.path, ob.content))])
       setApiOk(true)
     } catch {
       setApiOk(false)
+      // つながらないときは、前に受けとった一覧(と端末で書いた分)を出す
+      const cached = await offlineTree().catch(() => null)
+      if (cached) setNotes((cur) => (cur.length && !cached.length ? cur : cached))
     }
   }, [])
   const loadFavs = useCallback(async () => {
@@ -223,7 +233,21 @@ export default function App() {
       if (err.status === 404 && opts.quiet) store('last.note', '')
       else if (err.status === 404) setNotice(`「${path}」は見つかりませんでした(移動・削除されたかもしれません)`)
       else if (err.network) {
-        // サーバーに届かないときでも、端末に残した送信待ちがあればそれを開く
+        // サーバーに届かないときは、端末の写し(と送信待ち)を開く。書いた分は、つながったときサーバーの版とくらべて送る
+        const copy = await getCopy(path).catch(() => undefined)
+        if (copy && seq === openSeq.current) {
+          const { content } = await engine.open(path, copy.content, copy.etag)
+          docPathRef.current = path
+          setDraft(null)
+          setTitle(nameOf(path))
+          setActive(path)
+          setText(path, content)
+          setDoc({ path, content, seq: Date.now() })
+          setNotice('サーバーにつながらないので、端末の写しを開きました。書いた分はつながりしだい送ります')
+          if (opts.push !== false && hashPath() !== path) history.pushState(null, '', '#/' + encodeURI(path))
+          if (isMobile()) setSidebarOpen(false)
+          return
+        }
         const mine = await engine.mineContent(path)
         if (mine !== null) {
           docPathRef.current = path
@@ -264,16 +288,24 @@ export default function App() {
     if (isMobile()) setSidebarOpen(false)
   }, [])
   // 名前を指定して作る([[まだ無いノート]] や、探す画面の「新しく作る」)
+  // ノートを作る。つながらなければ端末に作り、つながったら送る。'server' = 作れた / 'local' = 端末に残した / null = 作れない
+  const createNote = async (path: string, content: string): Promise<'server' | 'local' | null> => {
+    try {
+      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content }) })
+      await loadTree()
+      return 'server'
+    } catch (e) {
+      const err = e as ApiError
+      if (!err.network) { setToast({ text: `作れませんでした: ${err.message}` }); return null }
+      await engine.create(path, content)
+      setNotes((list) => [...list.filter((n) => n.path !== path), noteFromText(path, content)])
+      return 'local'
+    }
+  }
   const createNamed = async (name: string, folder = memoFolder(), body = '') => {
     const n = uniqueName(folder, cleanName(name) || nameFromBody(body))
     const path = `${folder ? folder + '/' : ''}${n}.md`
-    try {
-      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content: newNoteContent('memo') + body }) })
-    } catch (e) {
-      setToast({ text: `作れませんでした: ${(e as ApiError).message}` })
-      return null
-    }
-    await loadTree()
+    if (!(await createNote(path, newNoteContent('memo') + body))) return null
     return path
   }
   const openNewNote = useCallback((name = '', folder?: string) => {
@@ -302,12 +334,21 @@ export default function App() {
           etag = (await api<{ etag: string }>('/api/notes', { method: 'POST', body: JSON.stringify({ path: p, content: header + body }) })).etag
           path = p
         } catch (e) {
-          if ((e as ApiError).status !== 409) throw e
+          if ((e as ApiError).status !== 409) {
+            if (!(e as ApiError).network) throw e
+            // つながらない: 端末に作っておき、つながったら送る(書き続けられる)
+            path = p
+            etag = NEW_NOTE
+          }
         }
       }
       if (!path) throw new Error('同じ名前のノートが多すぎます')
       if (!draftRef.current) return
-      await engine.open(path, header + body, etag)
+      if (etag === NEW_NOTE) {
+        await engine.create(path, header + body)
+        setNotes((list) => [...list.filter((n) => n.path !== path), noteFromText(path, header + body)])
+        setNotice('サーバーにつながらないので、端末に作りました。つながりしだい めも に作ります')
+      } else await engine.open(path, header + body, etag)
       docPathRef.current = path
       setDraft(null)
       setActive(path)
@@ -347,6 +388,20 @@ export default function App() {
       setNotice('書きかけのメモを戻しました。つながりしだい めも に作ります')
       setTimeout(() => void createFromDraftRef.current(), 1500)
     } else if (first) void openNote(first, { push: false })
+    // ホーム画面のショートカット(OMNI メモのウィジェットの代わり): ?go=task → タスクを足す / ?go=memo → すぐ書く
+    const go = new URLSearchParams(location.search).get('go')
+    if (go) {
+      history.replaceState(null, '', location.pathname + location.hash)
+      if (go === 'task') setView({ kind: 'tasks', add: true })
+      else if (go === 'tasks') setView({ kind: 'tasks' })
+      else if (go === 'memo') setTimeout(() => captureRef.current?.view?.focus(), 300)
+    }
+    // めも の写しを端末に持つ(つながらないときも読めて書ける)。開いたとき・つながったとき・5分ごと
+    const copy = () => { if (document.visibilityState === 'visible') void syncCopies().then(() => setCopied(Date.now())).catch(() => {}) }
+    void copiesAt().then((t) => t && setCopied(t))
+    copy()
+    const copyTimer = setInterval(copy, 5 * 60 * 1000)
+    window.addEventListener('online', copy)
     const onHash = () => { const p = hashPath(); if (p && p !== activeRef.current) void openNote(p, { push: false }) }
     window.addEventListener('popstate', onHash)
     const up = () => setOnline(true)
@@ -362,6 +417,8 @@ export default function App() {
       window.removeEventListener('online', up)
       window.removeEventListener('offline', down)
       clearInterval(health)
+      clearInterval(copyTimer)
+      window.removeEventListener('online', copy)
     }
   }, [loadTree, loadTags, loadFavs, openNote, startDraft])
 
@@ -448,16 +505,11 @@ export default function App() {
     const folder = memoFolder()
     const name = uniqueName(folder, nameFromBody(text))
     const path = `${folder ? folder + '/' : ''}${name}.md`
-    try {
-      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content: newNoteContent(captureTask ? 'task' : 'memo', { day: captureDate?.day ?? today() }) + text + '\n' }) })
-    } catch (e) {
-      setToast({ text: `まだ残せていません: ${(e as ApiError).message}(書いた内容は欄に残っています)` })
-      return
-    }
+    const how = await createNote(path, newNoteContent(captureTask ? 'task' : 'memo', { day: captureDate?.day ?? today() }) + text + '\n')
+    if (!how) return
     clearCapture()
     setCaptureTask(false)
-    await loadTree()
-    setToast({ text: `「${name}」を残しました`, action: '開く', onAction: () => void openNote(path) })
+    setToast({ text: how === 'local' ? `「${name}」を端末に残しました。つながりしだい めも に作ります` : `「${name}」を残しました`, action: '開く', onAction: () => void openNote(path) })
   }
 
   // すぐ書く欄を空にする(エディタの中身も直接消す。状態だけ空にしてもエディタには残るため)
@@ -533,15 +585,21 @@ export default function App() {
   }
   const goHome = () => { leaveNote(); setView({ kind: 'home' }) }
   const openCalendar = (day?: string) => { leaveNote(); setView({ kind: 'calendar', day }) }
+  const openTasks = (add = false) => { leaveNote(); setView({ kind: 'tasks', add }) }
+  // タスクの画面の「追加」: 名前だけで めも にタスクを作る(つながらなければ端末に)
+  const addTask = async (name: string, day: string) => {
+    const folder = memoFolder()
+    const n = uniqueName(folder, cleanName(name) || 'タスク')
+    const how = await createNote(`${folder ? folder + '/' : ''}${n}.md`, newNoteContent('task', { day }))
+    if (how) setToast({ text: how === 'local' ? `「${n}」を端末に残しました(${shortDay(day)})。つながりしだい送ります` : `「${n}」を ${shortDay(day)} に追加しました` })
+    return !!how
+  }
   // 制作ログ → 「この制作のメモを作る」(ひな形)・「メモをつなぐ」(プロパティ「制作ログ: 記録のID」を足す)
   const createSeisakuMemo = async (log: SeisakuLog) => {
     const folder = memoFolder()
     const name = uniqueName(folder, cleanName(log.title) || `制作 ${log.date}`)
     const path = `${folder ? folder + '/' : ''}${name}.md`
-    try {
-      await api('/api/notes', { method: 'POST', body: JSON.stringify({ path, content: seisakuTemplate(log) }) })
-    } catch (e) { setToast({ text: `作れませんでした: ${(e as ApiError).message}` }); return }
-    await loadTree()
+    if (!(await createNote(path, seisakuTemplate(log)))) return
     await openNote(path)
   }
   const linkSeisaku = async (log: SeisakuLog, path: string) => {
@@ -555,9 +613,22 @@ export default function App() {
     try {
       if (docPathRef.current === n.path) editHead(fn(contentRef.current))
       else {
-        const r = await api<NoteResponse>(notePath(n.path))
-        const next = applyChanges(r.content, fn(r.content))
-        await api(notePath(n.path), { method: 'PUT', body: JSON.stringify({ content: next, base_etag: r.etag, mutation_id: uuid() }) })
+        // 保存係を通す(つながらなければ端末の写しを書きかえて、あとで送る)
+        let content: string | null = null
+        try {
+          const r = await api<NoteResponse>(notePath(n.path))
+          content = (await engine.open(n.path, r.content, r.etag)).content
+        } catch (e) {
+          if (!(e as ApiError).network) throw e
+          content = await engine.mineContent(n.path) // 送れていない自分の版が先
+          if (content === null) {
+            const copy = await getCopy(n.path)
+            if (copy) content = (await engine.open(n.path, copy.content, copy.etag)).content
+          }
+          if (content === null) throw new ApiError('サーバーにつながらず、端末にも写しがありません', 0)
+        }
+        engine.edit(n.path, applyChanges(content, fn(content)))
+        engine.saveNow(n.path)
       }
       setNotes((list) => list.map((x) => (x.path === n.path ? { ...x, ...local } : x)))
       return true
@@ -908,6 +979,8 @@ export default function App() {
     const until = today(week)
     return notes.filter((n) => n.task && !n.done && n.task_day && n.task_day > today() && n.task_day <= until).sort((a, b) => a.task_day!.localeCompare(b.task_day!))
   }, [notes])
+  const overdueCount = useMemo(() => notes.filter((n) => n.task && !n.done && n.task_day && n.task_day < today()).length, [notes])
+  const troubles = engine.troubles()
   const greeting = () => { const h = new Date().getHours(); return h < 5 ? 'こんばんは' : h < 11 ? 'おはようございます' : h < 18 ? 'こんにちは' : 'こんばんは' }
   const statusMsg = sync && sync.message && sync.status !== 'saved' && sync.status !== 'conflict' ? sync.message : ''
 
@@ -946,6 +1019,7 @@ export default function App() {
           <div className="side-scroll">
             <nav className="side-nav">
               <button className={!doc && view.kind === 'home' ? 'on' : ''} onClick={goHome}><Home size={15} /> ホーム</button>
+              <button className={!doc && view.kind === 'tasks' ? 'on' : ''} onClick={() => openTasks()}><ListChecks size={15} /> タスク{overdueCount > 0 && <em className="side-badge">{overdueCount}</em>}</button>
               <button className={!doc && view.kind === 'calendar' ? 'on' : ''} onClick={() => openCalendar()}><CalendarDays size={15} /> 制作カレンダー</button>
             </nav>
             {favs.length > 0 && <section className="side-sec">
@@ -1090,8 +1164,13 @@ export default function App() {
                 </div>}
               </div>
             </article>
-          </> : view.kind === 'calendar' ? <SeisakuCalendar notes={notes} initialDay={view.day} onOpen={(p) => void openNote(p)} onCreate={(l) => void createSeisakuMemo(l)} onLink={(l, p) => void linkSeisaku(l, p)} /> : <div className="home">
+          </> : view.kind === 'tasks' ? <TasksView notes={notes} autoFocus={view.add} onOpen={(p) => void openNote(p)} onDone={(n, d) => void setTaskDone(n, d)} onMove={(n, d) => void moveTask(n, d).then((ok) => ok && setToast({ text: `「${n.name}」を ${shortDay(d)} にしました` }))} onAdd={addTask} /> : view.kind === 'calendar' ? <SeisakuCalendar notes={notes} initialDay={view.day} onOpen={(p) => void openNote(p)} onCreate={(l) => void createSeisakuMemo(l)} onLink={(l, p) => void linkSeisaku(l, p)} /> : <div className="home">
             {notice && <div className="notice">{notice}<button onClick={() => setNotice('')} aria-label="閉じる"><X size={14} /></button></div>}
+            {troubles.some((x) => x.status === 'conflict' || x.status === 'error') && <div className="notice bad">
+              <AlertTriangle size={14} /> 送れていないノートがあります(ほかの場所でも変わっていた・保存できなかった)。開いて選んでください:
+              {troubles.filter((x) => x.status === 'conflict' || x.status === 'error').map((x) => <button key={x.path} className="chip" onClick={() => void openNote(x.path)}>{nameOf(x.path)}</button>)}
+            </div>}
+            {troubles.some((x) => x.status === 'offline' || x.status === 'unsaved') && apiOk === false && <p className="home-pending"><CloudOff size={13} /> 端末に {troubles.filter((x) => x.status === 'offline' || x.status === 'unsaved').length}件 残っています。つながりしだい送ります</p>}
             <p className="home-date">{new Date().toLocaleDateString('ja-JP', { month: 'long', day: 'numeric', weekday: 'short' })}</p>
             <h1 className="home-hello">{greeting()}</h1>
             <div className="capture">
@@ -1124,7 +1203,7 @@ export default function App() {
             </div>}
             {apiOk === false && <p className="home-empty">サーバーにつながりません。つながると一覧が出ます。</p>}
             {(todayTasks.length > 0 || upcoming.length > 0) && <section className="home-sec">
-              <div className="sec-head"><h2>タスク</h2>{todayTasks.some((n) => n.task_day! < today()) && <button className="chip" onClick={() => void moveOverdue()}>期限切れ {todayTasks.filter((n) => n.task_day! < today()).length}件を今日に</button>}</div>
+              <div className="sec-head"><h2>タスク</h2><button className="chip" onClick={() => openTasks()}>すべてのタスク ›</button>{todayTasks.some((n) => n.task_day! < today()) && <button className="chip" onClick={() => void moveOverdue()}>期限切れ {todayTasks.filter((n) => n.task_day! < today()).length}件を今日に</button>}</div>
               <div className="task-list">
                 {[...todayTasks, ...upcoming].map((n) => (
                   <div key={n.path} className={`task-row ${n.done ? 'done' : ''}`}>
@@ -1182,6 +1261,7 @@ export default function App() {
         <div className="settings-head"><span className="settings-title">設定</span><button className="icon-button" onClick={() => setSettings(false)} aria-label="閉じる"><X size={16} /></button></div>
         <div className="settings-row"><div><strong>表示</strong><small>どれも書いたまま保存。見た目だけ変わる(Ctrl+E でソースと切りかえ)</small></div><select value={presentation} onChange={(e) => choosePresentation(e.target.value as Presentation)}>{PRESENTATIONS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}</select></div>
         <div className="settings-row"><div><strong>Obsidian の保管庫名</strong><small>「Obsidian で開く」に使う</small></div><input value={vaultName} onChange={(e) => { setVaultName(e.target.value); store('obsidian.vault', e.target.value) }} /></div>
+        <div className="settings-row"><div><strong>端末の写し</strong><small>めも を全部この端末に持っています。つながらないときも読めて書けます(5分ごとに更新)</small></div><span className="setting-value">{copied ? new Date(copied).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'まだ'}</span></div>
         <div className="settings-row"><div><strong>送信待ち</strong><small>端末に残っていて、サーバーの確認がまだのもの</small></div><span className="setting-value">{pending}件 {pending > 0 && <button className="btn tiny" onClick={() => engine.saveNow()}>今すぐ送る</button>}</span></div>
         {aiOn && <div className="settings-row"><div><strong>AI が自動で整える</strong><small>15分さわっていないタグなしの雑記に、タグ・期限つきのタスク・(自動で付いた名前なら)名前を。本文は変えない</small></div><input type="checkbox" checked={auto.enabled} onChange={(e) => api<typeof auto>('/api/ai/auto', { method: 'POST', body: JSON.stringify({ enabled: e.target.checked }) }).then(setAuto).catch(() => {})} aria-label="AI が自動で整える" /></div>}
         {aiOn && <div className="settings-row"><div><strong>AI(今月)</strong><small>{aiSpent ? `${aiSpent.spent.toFixed(1)}円 / 上限 ${aiSpent.cap.toFixed(0)}円(なんでも博士と同じクレジット)` : ''}{indexInfo ? ` · 索引 ${indexInfo.notes}件` : ''}</small></div><button className="btn tiny" onClick={() => { void api('/api/ai/index', { method: 'POST' }); api<typeof indexInfo>('/api/ai/index').then(setIndexInfo).catch(() => {}) }}>索引を更新</button></div>}

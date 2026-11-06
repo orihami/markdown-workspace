@@ -544,3 +544,29 @@ input, textarea { caret-color: var(--accent); }
   .cal-thumbs img:nth-child(2) { display: none; }
   .log-photos img { height: 96px; }
 }
+
+/* タスクの画面(OMNI メモのタスク一覧の代わり) */
+.tasks-page { max-width: 760px; margin: 0 auto; padding: 30px 40px 120px; }
+.tasks-page h1 { margin: 0 0 16px; font-size: 26px; letter-spacing: -0.02em; }
+.task-add { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line-2); background: #fff; border-radius: 12px; padding: 8px 8px 8px 12px; color: var(--muted); }
+.task-add:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.task-add input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; font-size: 16px; color: var(--ink); }
+.task-add small { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.task-filters { display: flex; gap: 6px; margin: 14px 0 10px; overflow-x: auto; scrollbar-width: none; padding-bottom: 2px; }
+.task-filters .chip { flex: none; }
+.task-filters .chip em { font-style: normal; font-size: 11px; background: var(--side-2); border-radius: 999px; padding: 0 6px; }
+.task-filters .chip.on em { background: #fff; }
+.date-chip { position: relative; }
+.date-chip input, .task-pick input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; }
+.task-search { display: flex; align-items: center; gap: 6px; color: var(--muted); border-bottom: 1px solid var(--line); padding: 4px 2px 8px; }
+.task-search input { flex: 1; border: 0; outline: 0; background: transparent; font-size: 14px; color: var(--ink); }
+.task-group { display: flex; align-items: baseline; gap: 6px; font-size: 12px; font-weight: 700; color: var(--muted); margin: 18px 0 2px; }
+.task-group small { font-weight: 400; color: var(--faint); }
+.task-pick { position: relative; display: inline-flex; align-items: center; background: var(--side); border-radius: 6px; padding: 2px 6px; font-size: 12px; cursor: pointer; }
+.tasks-empty { color: var(--muted); font-size: 14px; margin: 20px 2px; }
+.side-badge { margin-left: auto; font-style: normal; font-size: 11px; font-weight: 700; color: #fff; background: var(--bad); border-radius: 999px; padding: 0 6px; }
+.notice.bad { background: #fbeeec; color: var(--bad); flex-wrap: wrap; }
+.notice.bad .chip { margin-left: 0; background: #fff; border: 1px solid #eccac4; padding: 3px 10px; }
+.home-pending { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--warn); margin: 0 0 8px; }
+@media (max-width: 760px) { .tasks-page { padding: 18px 16px 100px; } }
+@media (max-width: 760px) { .toast { width: calc(100% - 24px); bottom: 64px; } .toast > span, .toast > p { flex: 1; } }
